@@ -75,7 +75,7 @@ def attach_metadata(sequences: Iterable[dict], encounters: pd.DataFrame, last_ev
             adjusted_stop = min(last_event, stop) if not pd.isna(stop) else last_event
         if pd.isna(adjusted_stop) or adjusted_stop < start:
             adjusted_stop = stop
-        if pd.isna(adjusted_stop):
+        if pd.isna(adjusted_stop) or adjusted_stop < start:
             continue
         records.append(
             {
