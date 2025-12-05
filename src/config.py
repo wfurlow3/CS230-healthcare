@@ -1,6 +1,11 @@
 SEED = 13
+# Default window used for sequence building (e.g., embeddings/MLM).
 WINDOW_HOURS = 24
 BIN_SIZE_HOURS = 6
+
+# LOS-specific windowing for downstream classification.
+LOS_WINDOW_HOURS = 1
+LOS_BIN_SIZE_HOURS = 1
 MAX_LEN = 256
 VOCAB_LIMIT = 8000
 MASK_PROB = 0.15
