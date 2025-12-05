@@ -10,23 +10,23 @@ import pandas as pd
 # No longer using BIN_SIZE_HOURS or WINDOW_HOURS - sequences are chronological
 from .data_io import load_conditions, load_encounters, load_observations, load_medications, load_patients
 from .vocab import build_vocab, save_vocab
-from .utils import clean_fragment, bucket_age, OBS_WHITELIST, bin_observation
+from .utils import clean_fragment, bucket_age
 
 def extract_encounter_windows(enc_df: pd.DataFrame) -> Dict[str, Tuple[pd.Timestamp, pd.Timestamp]]:
     windows = {}
     for _, row in enc_df.iterrows():
-        enc_id = row["Id"]
+        enc_id = row["ID"]
         start = row["START"]
         stop = row["STOP"]
         windows[str(enc_id)] = (start, stop)
     return windows
 
 def build_demo_by_encounter(patients_df, encounters_df):
-    patients = patients_df.set_index("Id")
+    patients = patients_df.set_index("ID")
     demo_by_enc = {}
 
     for _, row in encounters_df.iterrows():
-        enc_id = str(row["Id"])
+        enc_id = str(row["ID"])
         pat_id = row["PATIENT"]
         pat = patients.loc[pat_id]
 
@@ -63,21 +63,28 @@ def build_sequences(cond_df: pd.DataFrame, obs_df: pd.DataFrame, windows: Dict[s
         event_time = row["START"] if not pd.isna(row["START"]) else None
         events[enc_id].append((event_time, token))
 
-    # Observations (whitelisted + binned)
+    # Observations: presence tokens with category-based prefix to mirror LOS style
     for _, row in obs_df.iterrows():
         enc_id = str(row["ENCOUNTER"])
         if enc_id not in windows:
             continue
 
         code_clean = clean_fragment(row["CODE"])
-        if code_clean not in OBS_WHITELIST:
+        fragment = code_clean
+        if not fragment and not pd.isna(row["DESCRIPTION"]):
+            fragment = clean_fragment(row["DESCRIPTION"])
+        if not fragment:
             continue
 
-        value = float(row["VALUE"])
-        obs_type, bucket = bin_observation(code_clean, value)
+        category = str(row["CATEGORY"]).upper() if not pd.isna(row["CATEGORY"]) else ""
+        prefix = "OBS"
+        if "VITAL" in category:
+            prefix = "OBS_VITAL"
+        elif "LAB" in category:
+            prefix = "OBS_LAB"
 
-        token = f"OBS_{obs_type}_{bucket}"
-        event_time = row["DATE"]
+        token = f"{prefix}_{fragment}_SEEN"
+        event_time = row["DATE"] if not pd.isna(row["DATE"]) else None
         events[enc_id].append((event_time, token))
 
     # Medications
