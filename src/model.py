@@ -17,7 +17,11 @@ from .config import (
 )
 
 
-def make_mlm_model(vocab_size: int) -> BertForMaskedLM:
+def make_mlm_model(
+    vocab_size: int,
+    hidden_dropout_prob: float = HIDDEN_DROPOUT_PROB,
+    attn_dropout_prob: float = ATTN_DROPOUT_PROB,
+) -> BertForMaskedLM:
     config = BertConfig(
         vocab_size=vocab_size,
         hidden_size=HIDDEN_SIZE,
@@ -25,7 +29,7 @@ def make_mlm_model(vocab_size: int) -> BertForMaskedLM:
         num_attention_heads=NUM_ATTENTION_HEADS,
         intermediate_size=INTERMEDIATE_SIZE,
         max_position_embeddings=MAX_POSITION_EMBEDDINGS,
-        hidden_dropout_prob=HIDDEN_DROPOUT_PROB,
-        attention_probs_dropout_prob=ATTN_DROPOUT_PROB,
+        hidden_dropout_prob=hidden_dropout_prob,
+        attention_probs_dropout_prob=attn_dropout_prob,
     )
     return BertForMaskedLM(config)

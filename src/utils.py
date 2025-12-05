@@ -6,17 +6,17 @@ import pandas as pd
 
 
 OBS_WHITELIST = {
-    "8867-4": "HR",      # heart rate
-    "8480-6": "SBP",     # systolic BP
-    "8462-4": "DBP",     # diastolic BP
-    "9279-1": "RR",      # respiratory rate
-    "8310-5": "TEMP",    # body temp
-    "2708-6": "O2SAT",  # oxygen saturation ***
-    "39156-5": "BMI",    # body mass index
-    "2947-0": "NA",      # sodium
-    "6298-4": "K",       # potassium
-    "38483-4": "CREAT",   # creatinine
-    "718-7": "HGB",      # hemoglobin
+    "8867_4": "HR",      # heart rate
+    "8480_6": "SBP",     # systolic BP
+    "8462_4": "DBP",     # diastolic BP
+    "9279_1": "RR",      # respiratory rate
+    "8310_5": "TEMP",    # body temp
+    "2708_6": "O2SAT",   # oxygen saturation
+    "39156_5": "BMI",    # body mass index
+    "2947_0": "NA",      # sodium
+    "6298_4": "K",       # potassium
+    "38483_4": "CREAT",  # creatinine
+    "718_7": "HGB",      # hemoglobin
 }
 
 
