@@ -27,8 +27,12 @@ def load_medications(data_dir: str) -> pd.DataFrame:
     return df
 
 def load_patients(data_dir: str) -> pd.DataFrame:
-    path = os.path.join(data_dir, "medications.csv")
+    path = os.path.join(data_dir, "patients.csv")
     df = load_csv(path, date_cols=["BIRTHDATE"])
+    required = ["ID", "BIRTHDATE", "GENDER", "RACE"]
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise ValueError(f"patients.csv missing required columns: {missing}")
     return df
 
 def load_conditions(data_dir: str) -> pd.DataFrame:
