@@ -6,15 +6,7 @@ import numpy as np
 import pandas as pd
 
 
-def clean_fragment(value: Optional[object]) -> Optional[str]:
-    if value is None or (isinstance(value, float) and np.isnan(value)):
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    text = re.sub(r"[^A-Za-z0-9]+", "_", text.upper())
-    text = text.strip("_")
-    return text or None
+
 
 
 def load_csv(path: str, date_cols: Optional[Iterable[str]] = None) -> pd.DataFrame:
@@ -29,6 +21,15 @@ def load_csv(path: str, date_cols: Optional[Iterable[str]] = None) -> pd.DataFra
         df[col] = pd.to_datetime(df[col], errors="coerce", utc=True).dt.tz_convert(None)
     return df
 
+def load_medications(data_dir: str) -> pd.DataFrame:
+    path = os.path.join(data_dir, "medications.csv")
+    df = load_csv(path, date_cols=["START", "STOP"])
+    return df
+
+def load_patients(data_dir: str) -> pd.DataFrame:
+    path = os.path.join(data_dir, "medications.csv")
+    df = load_csv(path, date_cols=["BIRTHDATE"])
+    return df
 
 def load_conditions(data_dir: str) -> pd.DataFrame:
     path = os.path.join(data_dir, "conditions.csv")

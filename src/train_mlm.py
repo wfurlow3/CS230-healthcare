@@ -27,11 +27,19 @@ from .vocab import load_vocab
 def train_epoch(model: torch.nn.Module, dataloader: Iterable[Dict[str, torch.Tensor]], optimizer: torch.optim.Optimizer, device: torch.device, print_every: int = PRINT_EVERY):
     model.train()
     total_loss = 0.0
+    total_correct = 0
+    total_masked = 0
     progress = tqdm(dataloader, desc="train", leave=False)
     for step, batch in enumerate(progress):
         batch = {k: v.to(device) for k, v in batch.items()}
         outputs = model(**batch)
         loss = outputs.loss
+        with torch.no_grad():
+            predictions = outputs.logits.argmax(dim=-1)
+            labels = batch["labels"]
+            mask = labels != -100
+            total_correct += ((predictions == labels) & mask).sum().item()
+            total_masked += mask.sum().item()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
         optimizer.step()
@@ -40,22 +48,33 @@ def train_epoch(model: torch.nn.Module, dataloader: Iterable[Dict[str, torch.Ten
         if (step + 1) % print_every == 0:
             progress.set_postfix(loss=f"{loss.item():.4f}")
     progress.close()
-    return total_loss / max(1, len(dataloader))
+    avg_loss = total_loss / max(1, len(dataloader))
+    accuracy = total_correct / max(1, total_masked)
+    return avg_loss, accuracy
 
 
 def eval_epoch(model: torch.nn.Module, dataloader: Iterable[Dict[str, torch.Tensor]], device: torch.device):
     if dataloader is None or len(dataloader.dataset) == 0:
-        return float("nan")
+        return float("nan"), float("nan")
     model.eval()
     total_loss = 0.0
+    total_correct = 0
+    total_masked = 0
     with torch.no_grad():
         progress = tqdm(dataloader, desc="eval", leave=False)
         for batch in progress:
             batch = {k: v.to(device) for k, v in batch.items()}
             outputs = model(**batch)
             total_loss += outputs.loss.item()
+            predictions = outputs.logits.argmax(dim=-1)
+            labels = batch["labels"]
+            mask = labels != -100
+            total_correct += ((predictions == labels) & mask).sum().item()
+            total_masked += mask.sum().item()
         progress.close()
-    return total_loss / max(1, len(dataloader))
+    avg_loss = total_loss / max(1, len(dataloader))
+    accuracy = total_correct / max(1, total_masked)
+    return avg_loss, accuracy
 
 
 def demo_mask_fill(model: torch.nn.Module, sequences: Iterable[dict], vocab: Dict[str, int], idx_to_token: Dict[int, str], device: torch.device, max_examples: int = 3):
@@ -129,12 +148,12 @@ def main():
     num_epochs = NUM_EPOCHS
     for epoch in range(1, num_epochs + 1):
         print(f"epoch {epoch}/{num_epochs}")
-        train_loss = train_epoch(model, train_loader, optimizer, device)
-        val_loss = eval_epoch(model, val_loader, device)
+        train_loss, train_acc = train_epoch(model, train_loader, optimizer, device)
+        val_loss, val_acc = eval_epoch(model, val_loader, device)
         if np.isnan(val_loss):
-            print(f"  train loss: {train_loss:.4f} | val loss: n/a (no val set)")
+            print(f"  train loss: {train_loss:.4f} | train acc: {train_acc:.4f} | val loss: n/a (no val set) | val acc: n/a")
         else:
-            print(f"  train loss: {train_loss:.4f} | val loss: {val_loss:.4f}")
+            print(f"  train loss: {train_loss:.4f} | train acc: {train_acc:.4f} | val loss: {val_loss:.4f} | val acc: {val_acc:.4f}")
 
     model.save_pretrained(output_dir)
     print(f"saved model and artifacts to {output_dir}")
