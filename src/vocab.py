@@ -5,8 +5,8 @@ from typing import Dict, Iterable, Tuple
 
 from .config import SPECIAL_TOKENS, VOCAB_LIMIT
 
-MIN_FREQ_DX = 5
-MIN_FREQ_MED = 10
+MIN_FREQ_DX = 5  # legacy, no longer used for filtering
+MIN_FREQ_MED = 10  # legacy, no longer used for filtering
 
 
 def build_vocab(sequences: Iterable[dict], max_size: int = VOCAB_LIMIT) -> Tuple[Dict[str, int], Dict[int, str]]:
@@ -17,26 +17,21 @@ def build_vocab(sequences: Iterable[dict], max_size: int = VOCAB_LIMIT) -> Tuple
                 continue
             token_counts[token] += 1
 
-    vocab_tokens = []
-    for tok, count in token_counts.items():
-        if tok.startswith("OBS_"):
-            keep = True
-        elif tok.startswith("DX_"):
-            keep = count >= MIN_FREQ_DX
-        elif tok.startswith("MED_"):
-            keep = count >= MIN_FREQ_MED
-        else:
-            keep = False
-
-        if keep:
-            vocab_tokens.append(tok)
+    # Keep only OBS_, DX_, and MED_ tokens observed in the data (no filtering)
+    candidates_sorted = sorted(
+        [(tok, count) for tok, count in token_counts.items() if tok.startswith(("OBS_", "DX_", "MED_"))],
+        key=lambda x: (-x[1], x[0]),
+    )
 
     vocab_list = list(SPECIAL_TOKENS)
     remaining = max(0, max_size - len(vocab_list))
-    for tok in sorted(vocab_tokens):
+
+    # Fill remaining slots with highest-frequency candidates
+    for tok, _ in candidates_sorted:
         if len(vocab_list) >= max_size:
             break
-        vocab_list.append(tok)
+        if tok not in vocab_list:
+            vocab_list.append(tok)
 
     vocab = {tok: idx for idx, tok in enumerate(vocab_list)}
     idx_to_token = {idx: tok for tok, idx in vocab.items()}

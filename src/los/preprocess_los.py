@@ -1,4 +1,5 @@
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -8,10 +9,22 @@ import pandas as pd
 from scipy import sparse
 from sklearn.preprocessing import MultiLabelBinarizer
 
-from ..config import LOS_BIN_SIZE_HOURS, LOS_WINDOW_HOURS, SPECIAL_TOKENS
-from ..data_io import load_conditions, load_encounters, load_observations
-from ..utils import clean_fragment
-from ..vocab import load_vocab
+# Allow running as both a module (`python -m src.los.preprocess_los`)
+# and as a script (`python src/los/preprocess_los.py`) by falling back
+# to absolute imports if the relative import context is missing.
+try:
+    from ..config import LOS_BIN_SIZE_HOURS, LOS_WINDOW_HOURS, SPECIAL_TOKENS
+    from ..data_io import load_conditions, load_encounters, load_observations, load_medications
+    from ..utils import clean_fragment
+    from ..vocab import load_vocab
+except ImportError:  # pragma: no cover - only hit when executed as script
+    ROOT = Path(__file__).resolve().parents[2]
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from src.config import LOS_BIN_SIZE_HOURS, LOS_WINDOW_HOURS, SPECIAL_TOKENS
+    from src.data_io import load_conditions, load_encounters, load_observations, load_medications
+    from src.utils import clean_fragment
+    from src.vocab import load_vocab
 
 
 def filter_encounters_by_class(encounters: pd.DataFrame, allowed_classes: Sequence[str]) -> pd.DataFrame:
@@ -37,12 +50,15 @@ def extract_encounter_windows(enc_df: pd.DataFrame) -> Dict[str, Tuple[pd.Timest
 def build_los_sequences(
     cond_df: pd.DataFrame,
     obs_df: pd.DataFrame,
+    meds_df: pd.DataFrame,
     windows: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]],
     window_hours: int,
     bin_size_hours: int,
 ) -> List[Dict[str, Iterable[str]]]:
     events: Dict[str, List[Tuple[pd.Timestamp, str]]] = defaultdict(list)
+    dx_vs_other_stats = {"dx_only": 0, "dx_before_other": 0, "dx_after_other": 0, "dx_mixed": 0, "no_dx": 0}
 
+    # Only diagnosis codes (no description fallback) to align with pretrain vocab
     for _, row in cond_df.iterrows():
         enc_id = str(row["ENCOUNTER"])
         if enc_id not in windows:
@@ -52,22 +68,17 @@ def build_los_sequences(
             code = clean_fragment(row["CODE"])
             if code:
                 token = f"DX_{code}"
-        if not token and not pd.isna(row["DESCRIPTION"]):
-            desc = clean_fragment(row["DESCRIPTION"])
-            if desc:
-                token = f"DX_{desc}"
         if not token:
             continue
         event_time = row["START"] if not pd.isna(row["START"]) else None
         events[enc_id].append((event_time, token))
 
+    # Observations: presence tokens with category-based prefix (mirror pretrain)
     for _, row in obs_df.iterrows():
         enc_id = str(row["ENCOUNTER"])
         if enc_id not in windows:
             continue
-        fragment = None
-        if not pd.isna(row["CODE"]):
-            fragment = clean_fragment(row["CODE"])
+        fragment = clean_fragment(row["CODE"])
         if not fragment and not pd.isna(row["DESCRIPTION"]):
             fragment = clean_fragment(row["DESCRIPTION"])
         if not fragment:
@@ -82,36 +93,114 @@ def build_los_sequences(
         event_time = row["DATE"] if not pd.isna(row["DATE"]) else None
         events[enc_id].append((event_time, token))
 
+    # Medications to match pretrain MED_* tokens
+    for _, row in meds_df.iterrows():
+        enc_id = str(row["ENCOUNTER"])
+        if enc_id not in windows:
+            continue
+        if pd.isna(row["CODE"]):
+            continue
+        code = clean_fragment(row["CODE"])
+        if not code:
+            continue
+        token = f"MED_{code}"
+        event_time = row["START"] if not pd.isna(row["START"]) else None
+        events[enc_id].append((event_time, token))
+
     sequences = []
     num_bins = max(1, window_hours // bin_size_hours)
     for enc_id, (start_time, _) in windows.items():
         if pd.isna(start_time):
             continue
-        bin_sets = [set() for _ in range(num_bins)]
+        # Find earliest non-DX timestamp for this encounter (to compare DX ordering)
+        min_other_ts = None
+        for event_time, token in events.get(enc_id, []):
+            if token.startswith("DX_"):
+                continue
+            ts = event_time if event_time is not None and not pd.isna(event_time) else start_time
+            if pd.isna(ts):
+                continue
+            if min_other_ts is None or ts < min_other_ts:
+                min_other_ts = ts
+
+        # Debug: compare DX timing vs other tokens for this encounter
+        dx_ts = []
+        other_ts = []
+        for event_time, token in events.get(enc_id, []):
+            ts = event_time if event_time is not None and not pd.isna(event_time) else start_time
+            if pd.isna(ts):
+                continue
+            if token.startswith("DX_"):
+                dx_ts.append(ts)
+            else:
+                other_ts.append(ts)
+        if not dx_ts:
+            dx_vs_other_stats["no_dx"] += 1
+        elif not other_ts:
+            dx_vs_other_stats["dx_only"] += 1
+        else:
+            min_other, max_other = min(other_ts), max(other_ts)
+            any_before = any(ts < min_other for ts in dx_ts)
+            any_after = any(ts > max_other for ts in dx_ts)
+            if any_before and not any_after:
+                dx_vs_other_stats["dx_before_other"] += 1
+            elif any_after and not any_before:
+                dx_vs_other_stats["dx_after_other"] += 1
+            else:
+                dx_vs_other_stats["dx_mixed"] += 1
+        # Keep per-bin event lists with timestamps to preserve chronology
+        bin_events = [[] for _ in range(num_bins)]
         for event_time, token in events.get(enc_id, []):
             ts = event_time if event_time is not None and not pd.isna(event_time) else start_time
             if pd.isna(ts):
                 continue
             delta_hours = (ts - start_time).total_seconds() / 3600.0
+            # if token.startswith("DX_"):
+            #     # Keep DX only if within window AND not after earliest non-DX
+            #     if delta_hours < 0 or delta_hours >= window_hours:
+            #         continue
+            #     if min_other_ts is not None and ts > min_other_ts:
+            #         continue
+            #     delta_hours = max(0.0, min(delta_hours, window_hours - 1e-6))
+            # else:
             if delta_hours < 0 or delta_hours >= window_hours:
                 continue
-            bin_idx = min(int(delta_hours // bin_size_hours), len(bin_sets) - 1)
-            bin_sets[bin_idx].add(token)
+            bin_idx = min(int(delta_hours // bin_size_hours), len(bin_events) - 1)
+            bin_events[bin_idx].append((ts, token))
         seq_tokens = ["[ADMIT]"]
         total_event_tokens = 0
-        for bin_set in bin_sets:
-            bin_tokens = sorted(bin_set)
-            trimmed = bin_tokens[:20]
+        for evts in bin_events:
+            if not evts:
+                continue
+            # Sort by timestamp; keep first occurrence of each token in this bin
+            evts_sorted = sorted(evts, key=lambda x: x[0])
+            seen = set()
+            ordered_tokens = []
+            for _, tok in evts_sorted:
+                if tok in seen:
+                    continue
+                seen.add(tok)
+                ordered_tokens.append(tok)
+            trimmed = ordered_tokens[:20]
             total_event_tokens += len(trimmed)
             seq_tokens.extend(trimmed)
         seq_tokens.append("[DISCH]")
         if total_event_tokens == 0:
             continue
         sequences.append({"encounter": enc_id, "tokens": seq_tokens})
+
+    print(
+        "DX timing vs other tokens | "
+        f"dx_only={dx_vs_other_stats['dx_only']} | "
+        f"dx_before_other={dx_vs_other_stats['dx_before_other']} | "
+        f"dx_after_other={dx_vs_other_stats['dx_after_other']} | "
+        f"dx_mixed={dx_vs_other_stats['dx_mixed']} | "
+        f"no_dx={dx_vs_other_stats['no_dx']}"
+    )
     return sequences
 
 
-def compute_last_event_times(cond_df: pd.DataFrame, obs_df: pd.DataFrame) -> Dict[str, pd.Timestamp]:
+def compute_last_event_times(cond_df: pd.DataFrame, obs_df: pd.DataFrame, meds_df: pd.DataFrame) -> Dict[str, pd.Timestamp]:
     last_ts: Dict[str, pd.Timestamp] = {}
 
     def update(enc_id: str, ts: object):
@@ -129,6 +218,11 @@ def compute_last_event_times(cond_df: pd.DataFrame, obs_df: pd.DataFrame) -> Dic
     for _, row in obs_df.iterrows():
         enc_id = str(row["ENCOUNTER"])
         update(enc_id, row.get("DATE"))
+
+    for _, row in meds_df.iterrows():
+        enc_id = str(row["ENCOUNTER"])
+        update(enc_id, row.get("START"))
+        update(enc_id, row.get("STOP"))
 
     return last_ts
 
@@ -181,21 +275,53 @@ def compute_los_hours(records: List[dict]) -> Tuple[float, List[dict]]:
     return median_hours, records
 
 
-def build_los_instances(records: List[dict], vocab: Dict[str, int]) -> Tuple[List[dict], float]:
+def build_los_instances(records: List[dict], vocab: Dict[str, int], all_records: List[dict]) -> Tuple[List[dict], float]:
     specials = set(SPECIAL_TOKENS)
     vocab_tokens = {tok for tok in vocab if tok not in specials}
     records = sorted(records, key=lambda r: (r["patient"], r["start"]))
+    all_records = sorted(all_records, key=lambda r: (r["patient"], r["start"]))
     median_hours, records = compute_los_hours(records)
 
-    history: Dict[str, set] = defaultdict(set)
+    # Build comprehensive per-patient history from all encounters (not just labeled ones)
+    patient_history: Dict[str, List[dict]] = defaultdict(list)
+    for rec in all_records:
+        patient_history[rec["patient"]].append(rec)
+
+    history_tokens: Dict[str, List[str]] = defaultdict(list)
+    history_seen: Dict[str, set] = defaultdict(set)
     instances: List[dict] = []
     for record in records:
         patient = record["patient"]
-        prev_tokens = history[patient]
-        curr_tokens = {tok for tok in record["tokens"] if tok not in specials and tok in vocab_tokens}
-        combined_tokens = sorted(prev_tokens | curr_tokens)
+        # Accumulate history from all prior encounters (any class) for this patient
+        if patient_history.get(patient):
+            for hist_rec in patient_history[patient]:
+                if hist_rec["start"] >= record["start"]:
+                    break
+                for tok in hist_rec["tokens"]:
+                    if tok in specials or tok not in vocab_tokens:
+                        continue
+                    if tok in history_seen[patient]:
+                        continue
+                    history_seen[patient].add(tok)
+                    history_tokens[patient].append(tok)
+
+        prev_tokens = history_tokens[patient]
+        curr_tokens: List[str] = []
+        curr_seen = set()
+        for tok in record["tokens"]:
+            if tok in specials or tok not in vocab_tokens:
+                continue
+            if tok in curr_seen:
+                continue
+            curr_seen.add(tok)
+            curr_tokens.append(tok)
+
+        combined_tokens = prev_tokens + [tok for tok in curr_tokens if tok not in history_seen[patient]]
         if not combined_tokens:
-            history[patient].update(curr_tokens)
+            for tok in curr_tokens:
+                if tok not in history_seen[patient]:
+                    history_seen[patient].add(tok)
+                    history_tokens[patient].append(tok)
             continue
         label = int(record["los_hours"] > median_hours)
         instances.append(
@@ -211,7 +337,10 @@ def build_los_instances(records: List[dict], vocab: Dict[str, int]) -> Tuple[Lis
                 "curr_token_count": len(curr_tokens),
             }
         )
-        history[patient].update(curr_tokens)
+        for tok in curr_tokens:
+            if tok not in history_seen[patient]:
+                history_seen[patient].add(tok)
+                history_tokens[patient].append(tok)
     if not instances:
         raise ValueError("no labelable encounters were produced.")
     return instances, median_hours
@@ -243,13 +372,15 @@ def preprocess_los(raw_data_dir: Path, processed_dir: Path, allowed_classes: Seq
     encounters = load_encounters(str(raw_data_dir))
     conditions = load_conditions(str(raw_data_dir))
     observations = load_observations(str(raw_data_dir))
+    medications = load_medications(str(raw_data_dir))
     windows = extract_encounter_windows(encounters)
-    sequences = build_los_sequences(conditions, observations, windows, LOS_WINDOW_HOURS, LOS_BIN_SIZE_HOURS)
-    last_event_times = compute_last_event_times(conditions, observations)
-    encounters = filter_encounters_by_class(encounters, allowed_classes)
-    records = attach_metadata(sequences, encounters, last_event_times)
+    sequences = build_los_sequences(conditions, observations, medications, windows, LOS_WINDOW_HOURS, LOS_BIN_SIZE_HOURS)
+    last_event_times = compute_last_event_times(conditions, observations, medications)
+    encounters_filtered = filter_encounters_by_class(encounters, allowed_classes)
+    records_all = attach_metadata(sequences, encounters, last_event_times)
+    records = attach_metadata(sequences, encounters_filtered, last_event_times)
 
-    instances, median_hours = build_los_instances(records, vocab)
+    instances, median_hours = build_los_instances(records, vocab, records_all)
     inst_path = processed_dir / "los_instances.jsonl"
     save_instances(instances, inst_path)
 
