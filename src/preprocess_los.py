@@ -8,19 +8,10 @@ import pandas as pd
 from scipy import sparse
 from sklearn.preprocessing import MultiLabelBinarizer
 
-from .config import SPECIAL_TOKENS
+from .config import LOS_BIN_SIZE_HOURS, LOS_WINDOW_HOURS, SPECIAL_TOKENS
 from .data_io import load_conditions, load_encounters, load_observations
+from .utils import clean_fragment
 from .vocab import load_vocab
-
-
-def load_sequences(path: Path) -> List[dict]:
-    records = []
-    with open(path, "r") as f:
-        for line in f:
-            records.append(json.loads(line))
-    if not records:
-        raise ValueError(f"no sequences found in {path}")
-    return records
 
 
 def filter_encounters_by_class(encounters: pd.DataFrame, allowed_classes: Sequence[str]) -> pd.DataFrame:
@@ -31,6 +22,93 @@ def filter_encounters_by_class(encounters: pd.DataFrame, allowed_classes: Sequen
     if filtered.empty:
         raise ValueError(f"no encounters left after filtering for classes {allowed_classes}.")
     return filtered
+
+
+def extract_encounter_windows(enc_df: pd.DataFrame) -> Dict[str, Tuple[pd.Timestamp, pd.Timestamp]]:
+    windows = {}
+    for _, row in enc_df.iterrows():
+        enc_id = row["ID"]
+        start = row["START"]
+        stop = row["STOP"]
+        windows[str(enc_id)] = (start, stop)
+    return windows
+
+
+def build_los_sequences(
+    cond_df: pd.DataFrame,
+    obs_df: pd.DataFrame,
+    windows: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]],
+    window_hours: int,
+    bin_size_hours: int,
+) -> List[Dict[str, Iterable[str]]]:
+    events: Dict[str, List[Tuple[pd.Timestamp, str]]] = defaultdict(list)
+
+    for _, row in cond_df.iterrows():
+        enc_id = str(row["ENCOUNTER"])
+        if enc_id not in windows:
+            continue
+        token = None
+        if not pd.isna(row["CODE"]):
+            code = clean_fragment(row["CODE"])
+            if code:
+                token = f"DX_{code}"
+        if not token and not pd.isna(row["DESCRIPTION"]):
+            desc = clean_fragment(row["DESCRIPTION"])
+            if desc:
+                token = f"DX_{desc}"
+        if not token:
+            continue
+        event_time = row["START"] if not pd.isna(row["START"]) else None
+        events[enc_id].append((event_time, token))
+
+    for _, row in obs_df.iterrows():
+        enc_id = str(row["ENCOUNTER"])
+        if enc_id not in windows:
+            continue
+        fragment = None
+        if not pd.isna(row["CODE"]):
+            fragment = clean_fragment(row["CODE"])
+        if not fragment and not pd.isna(row["DESCRIPTION"]):
+            fragment = clean_fragment(row["DESCRIPTION"])
+        if not fragment:
+            continue
+        category = str(row["CATEGORY"]).upper() if not pd.isna(row["CATEGORY"]) else ""
+        prefix = "OBS"
+        if "VITAL" in category:
+            prefix = "OBS_VITAL"
+        elif "LAB" in category:
+            prefix = "OBS_LAB"
+        token = f"{prefix}_{fragment}_SEEN"
+        event_time = row["DATE"] if not pd.isna(row["DATE"]) else None
+        events[enc_id].append((event_time, token))
+
+    sequences = []
+    num_bins = max(1, window_hours // bin_size_hours)
+    for enc_id, (start_time, _) in windows.items():
+        if pd.isna(start_time):
+            continue
+        bin_sets = [set() for _ in range(num_bins)]
+        for event_time, token in events.get(enc_id, []):
+            ts = event_time if event_time is not None and not pd.isna(event_time) else start_time
+            if pd.isna(ts):
+                continue
+            delta_hours = (ts - start_time).total_seconds() / 3600.0
+            if delta_hours < 0 or delta_hours >= window_hours:
+                continue
+            bin_idx = min(int(delta_hours // bin_size_hours), len(bin_sets) - 1)
+            bin_sets[bin_idx].add(token)
+        seq_tokens = ["[ADMIT]"]
+        total_event_tokens = 0
+        for bin_set in bin_sets:
+            bin_tokens = sorted(bin_set)
+            trimmed = bin_tokens[:20]
+            total_event_tokens += len(trimmed)
+            seq_tokens.extend(trimmed)
+        seq_tokens.append("[DISCH]")
+        if total_event_tokens == 0:
+            continue
+        sequences.append({"encounter": enc_id, "tokens": seq_tokens})
+    return sequences
 
 
 def compute_last_event_times(cond_df: pd.DataFrame, obs_df: pd.DataFrame) -> Dict[str, pd.Timestamp]:
@@ -159,14 +237,14 @@ def vectorize_instances(instances: List[dict], vocab: Dict[str, int]) -> Tuple[s
 
 def preprocess_los(raw_data_dir: Path, processed_dir: Path, allowed_classes: Sequence[str] = ("INPATIENT",)) -> None:
     processed_dir.mkdir(parents=True, exist_ok=True)
-    seq_path = processed_dir / "sequences.jsonl"
     vocab_path = processed_dir / "vocab.json"
 
-    sequences = load_sequences(seq_path)
     vocab = load_vocab(vocab_path)
     encounters = load_encounters(str(raw_data_dir))
     conditions = load_conditions(str(raw_data_dir))
     observations = load_observations(str(raw_data_dir))
+    windows = extract_encounter_windows(encounters)
+    sequences = build_los_sequences(conditions, observations, windows, LOS_WINDOW_HOURS, LOS_BIN_SIZE_HOURS)
     last_event_times = compute_last_event_times(conditions, observations)
     encounters = filter_encounters_by_class(encounters, allowed_classes)
     records = attach_metadata(sequences, encounters, last_event_times)
