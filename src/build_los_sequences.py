@@ -2,31 +2,19 @@ import argparse
 import json
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
-
 import numpy as np
 import pandas as pd
 from scipy import sparse
 from sklearn.preprocessing import MultiLabelBinarizer
 
-from .build_sequences import build_sequences, extract_encounter_windows
+from .build_sequences import build_demo_by_encounter, build_sequences, extract_encounter_windows
 from .config import LOS_WINDOW_HOURS, SPECIAL_TOKENS
-from .data_io import load_conditions, load_encounters, load_observations
+from .data_io import load_conditions, load_encounters, load_observations, load_patients
 from .vocab import load_vocab
 
 
-def filter_encounters_by_class(encounters: pd.DataFrame, allowed_classes: Sequence[str]) -> pd.DataFrame:
-    if "ENCOUNTERCLASS" not in encounters.columns:
-        raise ValueError("encounters.csv missing ENCOUNTERCLASS column needed for LOS filtering.")
-    allowed = {c.upper() for c in allowed_classes}
-    filtered = encounters[encounters["ENCOUNTERCLASS"].str.upper().isin(allowed)]
-    if filtered.empty:
-        raise ValueError(f"no encounters matched LOS classes: {sorted(allowed)}")
-    return filtered
-
-
-def build_patient_event_index(events_by_encounter: Dict[str, Iterable[Tuple[pd.Timestamp, str]]], encounters: pd.DataFrame) -> Dict[str, List[Tuple[pd.Timestamp, str]]]:
-    patient_events: Dict[str, List[Tuple[pd.Timestamp, str]]] = defaultdict(list)
+def build_patient_event_index(events_by_encounter, encounters):
+    patient_events = defaultdict(list)
     patient_by_encounter = {}
     for _, row in encounters.iterrows():
         patient_by_encounter[str(row["ID"])] = str(row.get("PATIENT"))
@@ -43,22 +31,15 @@ def build_patient_event_index(events_by_encounter: Dict[str, Iterable[Tuple[pd.T
     return patient_events
 
 
-def build_los_sequences(
-    events_by_encounter: Dict[str, Iterable[Tuple[pd.Timestamp, str]]],
-    encounters: pd.DataFrame,
-    vocab: Dict[str, int],
-    cutoff_hours: float = LOS_WINDOW_HOURS,
-    allowed_classes: Sequence[str] = ("INPATIENT",),
-) -> Tuple[List[dict], float]:
-    allowed = filter_encounters_by_class(encounters, allowed_classes)
+def build_los_sequences(events_by_encounter, encounters, vocab, demo_by_enc=None, cutoff_hours=LOS_WINDOW_HOURS):
     patient_events = build_patient_event_index(events_by_encounter, encounters)
     cutoff_delta = pd.Timedelta(hours=cutoff_hours)
     specials = set(SPECIAL_TOKENS)
     vocab_tokens = {tok for tok in vocab if tok not in specials}
-
-    records: List[dict] = []
+    inpatient = encounters[encounters["ENCOUNTERCLASS"] == "Inpatient"]
+    records = []
     lengths = []
-    for _, row in allowed.iterrows():
+    for _, row in inpatient.iterrows():
         enc_id = str(row["ID"])
         patient = str(row.get("PATIENT"))
         start = row.get("START")
@@ -71,13 +52,16 @@ def build_los_sequences(
         cutoff_time = start + cutoff_delta
 
         tokens = []
-        seen = set()
+        if demo_by_enc and enc_id in demo_by_enc:
+            demo = demo_by_enc[enc_id]
+            for tok in (demo.get("sex"), demo.get("race"), demo.get("age")):
+                if tok and tok in vocab_tokens:
+                    tokens.append(tok)
         for ts, token in patient_events.get(patient, []):
             if pd.isna(ts) or ts > cutoff_time:
                 continue
-            if token in vocab_tokens and token not in seen:
+            if token in vocab_tokens:
                 tokens.append(token)
-                seen.add(token)
 
         if not tokens:
             continue
@@ -95,7 +79,7 @@ def build_los_sequences(
         )
 
     if not records:
-        raise ValueError("no LOS sequences generated; check encounter classes and cutoff.")
+        raise ValueError("no LOS sequences generated; check cutoff and data validity.")
 
     median_hours = float(np.median(lengths))
     for record in records:
@@ -104,14 +88,14 @@ def build_los_sequences(
     return records, median_hours
 
 
-def save_jsonl(records: Iterable[dict], path: Path) -> None:
+def save_jsonl(records, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         for record in records:
             f.write(json.dumps(record) + "\n")
 
 
-def vectorize_instances(records: List[dict], vocab: Dict[str, int]) -> Tuple[sparse.csr_matrix, np.ndarray, List[str], List[str], List[str]]:
+def vectorize_instances(records, vocab):
     specials = set(SPECIAL_TOKENS)
     classes = [tok for tok, idx in sorted(vocab.items(), key=lambda item: item[1]) if tok not in specials]
     mlb = MultiLabelBinarizer(classes=classes, sparse_output=True)
@@ -122,48 +106,37 @@ def vectorize_instances(records: List[dict], vocab: Dict[str, int]) -> Tuple[spa
     patients = [rec["patient"] for rec in records]
     return sparse.csr_matrix(X), y, encounters, patients, classes
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build LOS sequences using token events from build_sequences.")
-    parser.add_argument("--raw_dir", type=Path, default=Path("data") / "raw", help="Directory containing raw CSVs.")
-    parser.add_argument("--processed_dir", type=Path, default=Path("data") / "processed", help="Directory containing vocab.json and where LOS outputs are written.")
-    parser.add_argument("--allowed_classes", type=str, nargs="+", default=["INPATIENT"], help="Encounter classes to include.")
-    parser.add_argument("--cutoff_hours", type=float, default=LOS_WINDOW_HOURS, help="Include patient events up to this many hours after encounter start.")
-    return parser.parse_args()
-
-
 def main():
-    args = parse_args()
+    base_dir = Path.cwd()
+    raw_dir = base_dir / "data" / "raw"
+    processed_dir = base_dir / "data" / "processed"
 
-    encounters = load_encounters(str(args.raw_dir))
-    conditions = load_conditions(str(args.raw_dir))
-    observations = load_observations(str(args.raw_dir))
+    encounters = load_encounters(str(raw_dir))
+    conditions = load_conditions(str(raw_dir))
+    observations = load_observations(str(raw_dir))
+    patients = load_patients(str(raw_dir))
     windows = extract_encounter_windows(encounters)
 
-    try:
-        sequences, events_by_encounter = build_sequences(conditions, observations, windows, return_events=True)
-    except TypeError as e:
-        raise RuntimeError("build_sequences must support return_events=True to supply events for LOS.") from e
-    if not events_by_encounter:
-        raise ValueError("no events returned from build_sequences; cannot build LOS sequences.")
+    sequences, events_by_encounter = build_sequences(conditions, observations, windows, return_events=True)
+    demo_by_enc = build_demo_by_encounter(patients, encounters)
 
-    vocab_path = args.processed_dir / "vocab.json"
+    vocab_path = processed_dir / "vocab.json"
     vocab = load_vocab(vocab_path)
 
     records, median_hours = build_los_sequences(
         events_by_encounter,
         encounters,
         vocab,
-        cutoff_hours=args.cutoff_hours,
-        allowed_classes=args.allowed_classes,
+        demo_by_enc,
+        cutoff_hours=1,
     )
 
-    inst_path = args.processed_dir / "los_instances.jsonl"
+    inst_path = processed_dir / "los_instances.jsonl"
     save_jsonl(records, inst_path)
 
     X, y, encounter_ids, patient_ids, classes = vectorize_instances(records, vocab)
-    features_path = args.processed_dir / "los_features.npz"
-    labels_path = args.processed_dir / "los_labels.npz"
+    features_path = processed_dir / "los_features.npz"
+    labels_path = processed_dir / "los_labels.npz"
     sparse.save_npz(features_path, X)
     np.savez_compressed(
         labels_path,

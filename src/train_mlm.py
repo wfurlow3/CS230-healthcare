@@ -4,6 +4,7 @@ import json
 import math
 import os
 import random
+from collections import Counter
 from itertools import product
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -37,11 +38,14 @@ def train_epoch(
     device: torch.device,
     print_every: int = PRINT_EVERY,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-):
+) -> tuple[float, float, float, Counter]:
     model.train()
     total_loss = 0.0
     total_correct = 0
+    total_correct_wo_kept = 0
     total_masked = 0
+    total_masked_wo_kept = 0
+    label_counter: Counter = Counter()
     progress = tqdm(dataloader, desc="train", leave=False)
     for step, batch in enumerate(progress):
         batch = {k: v.to(device) for k, v in batch.items()}
@@ -51,8 +55,12 @@ def train_epoch(
             predictions = outputs.logits.argmax(dim=-1)
             labels = batch["labels"]
             mask = labels != -100
+            kept_mask = mask & (batch["input_ids"] == labels)
             total_correct += ((predictions == labels) & mask).sum().item()
             total_masked += mask.sum().item()
+            total_correct_wo_kept += ((predictions == labels) & mask & ~kept_mask).sum().item()
+            total_masked_wo_kept += (mask & ~kept_mask).sum().item()
+            label_counter.update(labels[mask].detach().cpu().tolist())
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
         optimizer.step()
@@ -65,16 +73,19 @@ def train_epoch(
     progress.close()
     avg_loss = total_loss / max(1, len(dataloader))
     accuracy = total_correct / max(1, total_masked)
-    return avg_loss, accuracy
+    accuracy_wo_kept = total_correct_wo_kept / max(1, total_masked_wo_kept)
+    return avg_loss, accuracy, accuracy_wo_kept, label_counter
 
 
 def eval_epoch(model: torch.nn.Module, dataloader: Iterable[Dict[str, torch.Tensor]], device: torch.device):
     if dataloader is None or len(dataloader.dataset) == 0:
-        return float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan")
     model.eval()
     total_loss = 0.0
     total_correct = 0
+    total_correct_wo_kept = 0
     total_masked = 0
+    total_masked_wo_kept = 0
     with torch.no_grad():
         progress = tqdm(dataloader, desc="eval", leave=False)
         for batch in progress:
@@ -84,12 +95,16 @@ def eval_epoch(model: torch.nn.Module, dataloader: Iterable[Dict[str, torch.Tens
             predictions = outputs.logits.argmax(dim=-1)
             labels = batch["labels"]
             mask = labels != -100
+            kept_mask = mask & (batch["input_ids"] == labels)
             total_correct += ((predictions == labels) & mask).sum().item()
             total_masked += mask.sum().item()
+            total_correct_wo_kept += ((predictions == labels) & mask & ~kept_mask).sum().item()
+            total_masked_wo_kept += (mask & ~kept_mask).sum().item()
         progress.close()
     avg_loss = total_loss / max(1, len(dataloader))
     accuracy = total_correct / max(1, total_masked)
-    return avg_loss, accuracy
+    accuracy_wo_kept = total_correct_wo_kept / max(1, total_masked_wo_kept)
+    return avg_loss, accuracy, accuracy_wo_kept
 
 
 def demo_mask_fill(
@@ -140,6 +155,18 @@ def demo_mask_fill(
 def load_sequences(seq_path: Path):
     with open(seq_path, "r") as f:
         return [json.loads(line) for line in f]
+
+
+def print_label_distribution(label_counter: Counter, idx_to_token: Dict[int, str], top_k: int = 10):
+    total = sum(label_counter.values())
+    if total == 0:
+        print("no masked labels observed during training.")
+        return
+    print("top masked labels (token_id: token -> count | pct):")
+    for idx, count in label_counter.most_common(top_k):
+        tok = idx_to_token.get(idx, f"<id={idx}>")
+        pct = (count / total) * 100.0
+        print(f"  {idx}: {tok} -> {count} ({pct:.2f}%)")
 
 
 def run_experiment(config: Dict, seed: int = SEED) -> Dict:
@@ -195,19 +222,24 @@ def run_experiment(config: Dict, seed: int = SEED) -> Dict:
     last_train_acc = float("nan")
     last_val_loss = float("nan")
     last_val_acc = float("nan")
+    last_train_acc_wo_kept = float("nan")
+    last_val_acc_wo_kept = float("nan")
     for epoch in range(1, num_epochs + 1):
         print(f"epoch {epoch}/{num_epochs}")
-        last_train_loss, last_train_acc = train_epoch(
+        last_train_loss, last_train_acc, last_train_acc_wo_kept, label_counter = train_epoch(
             model, train_loader, optimizer, device, scheduler=scheduler
         )
-        last_val_loss, last_val_acc = eval_epoch(model, val_loader, device)
+        last_val_loss, last_val_acc, last_val_acc_wo_kept = eval_epoch(model, val_loader, device)
         if np.isnan(last_val_loss):
             print(
-                f"  train loss: {last_train_loss:.4f} | train acc: {last_train_acc:.4f} | val loss: n/a (no val set) | val acc: n/a"
+                f"  train loss: {last_train_loss:.4f} | train acc: {last_train_acc:.4f} | "
+                f"train acc (excl kept): {last_train_acc_wo_kept:.4f} | val loss: n/a (no val set) | val acc: n/a | val acc (excl kept): n/a"
             )
         else:
             print(
-                f"  train loss: {last_train_loss:.4f} | train acc: {last_train_acc:.4f} | val loss: {last_val_loss:.4f} | val acc: {last_val_acc:.4f}"
+                f"  train loss: {last_train_loss:.4f} | train acc: {last_train_acc:.4f} | "
+                f"train acc (excl kept): {last_train_acc_wo_kept:.4f} | "
+                f"val loss: {last_val_loss:.4f} | val acc: {last_val_acc:.4f} | val acc (excl kept): {last_val_acc_wo_kept:.4f}"
             )
             if last_val_loss < best_val_loss:
                 best_val_loss = last_val_loss
@@ -217,6 +249,7 @@ def run_experiment(config: Dict, seed: int = SEED) -> Dict:
                 if patience >= 3:
                     print("Early stopping: validation loss did not improve for 3 checks.")
                     break
+        print_label_distribution(label_counter, idx_to_token)
 
     model.save_pretrained(output_dir)
     print(f"saved model and artifacts to {output_dir}")
@@ -225,8 +258,10 @@ def run_experiment(config: Dict, seed: int = SEED) -> Dict:
     return {
         "train_loss": last_train_loss,
         "train_accuracy": last_train_acc,
+        "train_accuracy_excl_kept": last_train_acc_wo_kept,
         "val_loss": last_val_loss,
         "val_accuracy": last_val_acc,
+        "val_accuracy_excl_kept": last_val_acc_wo_kept,
         "config": config,
     }
 
@@ -271,6 +306,7 @@ def run_hparam_search():
         "train_loss",
         "val_loss",
         "val_accuracy",
+        "val_accuracy_excl_kept",
     ]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -286,12 +322,12 @@ def run_hparam_search():
     best = results_sorted[0]
     print("\nResults (sorted by val_loss, tie-breaker val_accuracy):")
     print(
-        f"{'lr':>10} {'dropout':>10} {'w_decay':>10} {'val_loss':>10} {'val_acc':>10} {'train_loss':>12}"
+        f"{'lr':>10} {'dropout':>10} {'w_decay':>10} {'val_loss':>10} {'val_acc':>10} {'val_acc_no_keep':>15} {'train_loss':>12}"
     )
     for r in results_sorted:
         marker = "*" if r is best else " "
         print(
-            f"{marker} {r['learning_rate']:>9.6f} {r['dropout']:>10.2f} {r['weight_decay']:>10.3f} {r['val_loss']:>10.4f} {r['val_accuracy']:>10.4f} {r['train_loss']:>12.4f}"
+            f"{marker} {r['learning_rate']:>9.6f} {r['dropout']:>10.2f} {r['weight_decay']:>10.3f} {r['val_loss']:>10.4f} {r['val_accuracy']:>10.4f} {r.get('val_accuracy_excl_kept', float('nan')):>15.4f} {r['train_loss']:>12.4f}"
         )
     print(
         f"\nBest config: lr={best['learning_rate']}, dropout={best['dropout']}, weight_decay={best['weight_decay']} (val_loss={best['val_loss']:.4f}, val_acc={best['val_accuracy']:.4f})"
@@ -307,6 +343,7 @@ def run_hparam_search():
         "train_accuracy": best.get("train_accuracy"),
         "val_loss": best.get("val_loss"),
         "val_accuracy": best.get("val_accuracy"),
+        "val_accuracy_excl_kept": best.get("val_accuracy_excl_kept"),
         "batch_size": BATCH_SIZE,
         "num_epochs": NUM_EPOCHS,
         "seed": SEED,
