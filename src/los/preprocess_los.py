@@ -279,7 +279,7 @@ def build_los_instances(records: List[dict], vocab: Dict[str, int]) -> Tuple[Lis
         curr_tokens = {
             tok
             for tok in record["tokens"]
-            if tok not in specials and tok.startswith("DX_")
+            if tok not in specials and tok in vocab_tokens
         }
         combined_tokens = sorted(prev_tokens | curr_tokens)
         if not combined_tokens:
