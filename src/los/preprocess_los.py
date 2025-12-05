@@ -148,7 +148,8 @@ def build_los_sequences(
                 dx_vs_other_stats["dx_after_other"] += 1
             else:
                 dx_vs_other_stats["dx_mixed"] += 1
-        bin_sets = [set() for _ in range(num_bins)]
+        # Keep per-bin event lists with timestamps to preserve chronology
+        bin_events = [[] for _ in range(num_bins)]
         for event_time, token in events.get(enc_id, []):
             ts = event_time if event_time is not None and not pd.isna(event_time) else start_time
             if pd.isna(ts):
@@ -164,13 +165,23 @@ def build_los_sequences(
             # else:
             if delta_hours < 0 or delta_hours >= window_hours:
                 continue
-            bin_idx = min(int(delta_hours // bin_size_hours), len(bin_sets) - 1)
-            bin_sets[bin_idx].add(token)
+            bin_idx = min(int(delta_hours // bin_size_hours), len(bin_events) - 1)
+            bin_events[bin_idx].append((ts, token))
         seq_tokens = ["[ADMIT]"]
         total_event_tokens = 0
-        for bin_set in bin_sets:
-            bin_tokens = sorted(bin_set)
-            trimmed = bin_tokens[:20]
+        for evts in bin_events:
+            if not evts:
+                continue
+            # Sort by timestamp; keep first occurrence of each token in this bin
+            evts_sorted = sorted(evts, key=lambda x: x[0])
+            seen = set()
+            ordered_tokens = []
+            for _, tok in evts_sorted:
+                if tok in seen:
+                    continue
+                seen.add(tok)
+                ordered_tokens.append(tok)
+            trimmed = ordered_tokens[:20]
             total_event_tokens += len(trimmed)
             seq_tokens.extend(trimmed)
         seq_tokens.append("[DISCH]")
@@ -264,26 +275,53 @@ def compute_los_hours(records: List[dict]) -> Tuple[float, List[dict]]:
     return median_hours, records
 
 
-def build_los_instances(records: List[dict], vocab: Dict[str, int]) -> Tuple[List[dict], float]:
+def build_los_instances(records: List[dict], vocab: Dict[str, int], all_records: List[dict]) -> Tuple[List[dict], float]:
     specials = set(SPECIAL_TOKENS)
     vocab_tokens = {tok for tok in vocab if tok not in specials}
     records = sorted(records, key=lambda r: (r["patient"], r["start"]))
+    all_records = sorted(all_records, key=lambda r: (r["patient"], r["start"]))
     median_hours, records = compute_los_hours(records)
 
-    history: Dict[str, set] = defaultdict(set)
+    # Build comprehensive per-patient history from all encounters (not just labeled ones)
+    patient_history: Dict[str, List[dict]] = defaultdict(list)
+    for rec in all_records:
+        patient_history[rec["patient"]].append(rec)
+
+    history_tokens: Dict[str, List[str]] = defaultdict(list)
+    history_seen: Dict[str, set] = defaultdict(set)
     instances: List[dict] = []
     for record in records:
         patient = record["patient"]
-        prev_tokens = history[patient]
-        # Keep all DX_* tokens regardless of vocab; for others, require presence in vocab.
-        curr_tokens = {
-            tok
-            for tok in record["tokens"]
-            if tok not in specials and tok in vocab_tokens
-        }
-        combined_tokens = sorted(prev_tokens | curr_tokens)
+        # Accumulate history from all prior encounters (any class) for this patient
+        if patient_history.get(patient):
+            for hist_rec in patient_history[patient]:
+                if hist_rec["start"] >= record["start"]:
+                    break
+                for tok in hist_rec["tokens"]:
+                    if tok in specials or tok not in vocab_tokens:
+                        continue
+                    if tok in history_seen[patient]:
+                        continue
+                    history_seen[patient].add(tok)
+                    history_tokens[patient].append(tok)
+
+        prev_tokens = history_tokens[patient]
+        curr_tokens: List[str] = []
+        curr_seen = set()
+        for tok in record["tokens"]:
+            if tok in specials or tok not in vocab_tokens:
+                continue
+            if tok in curr_seen:
+                continue
+            curr_seen.add(tok)
+            curr_tokens.append(tok)
+
+        combined_tokens = prev_tokens + [tok for tok in curr_tokens if tok not in history_seen[patient]]
         if not combined_tokens:
-            history[patient].update(curr_tokens)
+            for tok in curr_tokens:
+                if tok not in history_seen[patient]:
+                    history_seen[patient].add(tok)
+                    history_tokens[patient].append(tok)
             continue
         label = int(record["los_hours"] > median_hours)
         instances.append(
@@ -299,7 +337,10 @@ def build_los_instances(records: List[dict], vocab: Dict[str, int]) -> Tuple[Lis
                 "curr_token_count": len(curr_tokens),
             }
         )
-        history[patient].update(curr_tokens)
+        for tok in curr_tokens:
+            if tok not in history_seen[patient]:
+                history_seen[patient].add(tok)
+                history_tokens[patient].append(tok)
     if not instances:
         raise ValueError("no labelable encounters were produced.")
     return instances, median_hours
@@ -335,10 +376,11 @@ def preprocess_los(raw_data_dir: Path, processed_dir: Path, allowed_classes: Seq
     windows = extract_encounter_windows(encounters)
     sequences = build_los_sequences(conditions, observations, medications, windows, LOS_WINDOW_HOURS, LOS_BIN_SIZE_HOURS)
     last_event_times = compute_last_event_times(conditions, observations, medications)
-    encounters = filter_encounters_by_class(encounters, allowed_classes)
-    records = attach_metadata(sequences, encounters, last_event_times)
+    encounters_filtered = filter_encounters_by_class(encounters, allowed_classes)
+    records_all = attach_metadata(sequences, encounters, last_event_times)
+    records = attach_metadata(sequences, encounters_filtered, last_event_times)
 
-    instances, median_hours = build_los_instances(records, vocab)
+    instances, median_hours = build_los_instances(records, vocab, records_all)
     inst_path = processed_dir / "los_instances.jsonl"
     save_instances(instances, inst_path)
 
