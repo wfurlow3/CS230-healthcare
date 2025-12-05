@@ -6,112 +6,34 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
+from sklearn.preprocessing import MultiLabelBinarizer
 
-from .config import SPECIAL_TOKENS
-from .utils import OBS_WHITELIST, bucket_age, clean_fragment, bin_observation
+from .build_sequences import build_sequences, extract_encounter_windows
+from .config import LOS_WINDOW_HOURS, SPECIAL_TOKENS
+from .data_io import load_conditions, load_encounters, load_observations
 from .vocab import load_vocab
-from .data_io import load_conditions, load_encounters, load_observations, load_medications, load_patients
 
-ALLOWED_L0S_CLASSES = ("INPATIENT",)
 
-def filter_encounters_by_class(encounters, allowed):
+def filter_encounters_by_class(encounters: pd.DataFrame, allowed_classes: Sequence[str]) -> pd.DataFrame:
     if "ENCOUNTERCLASS" not in encounters.columns:
-        raise ValueError("encounters.csv missing ENCOUNTERCLASS column required for LOS filtering.")
-    allowed_upper = {c.upper() for c in allowed}
-    mask = encounters["ENCOUNTERCLASS"].str.upper().isin(allowed_upper)
-    filtered = encounters[mask].copy()
+        raise ValueError("encounters.csv missing ENCOUNTERCLASS column needed for LOS filtering.")
+    allowed = {c.upper() for c in allowed_classes}
+    filtered = encounters[encounters["ENCOUNTERCLASS"].str.upper().isin(allowed)]
     if filtered.empty:
-        raise ValueError(f"no encounters matched LOS classes: {allowed_upper}")
+        raise ValueError(f"no encounters matched LOS classes: {sorted(allowed)}")
     return filtered
 
 
-def build_demo_by_encounter(patients_df, encounters_df):
-    patients = patients_df.set_index("ID")
-    demo_by_enc = {}
-    for _, row in encounters_df.iterrows():
-        enc_id = str(row["ID"])
-        pat_id = row["PATIENT"]
-        if pat_id not in patients.index:
-            continue
-        pat = patients.loc[pat_id]
-        start = row["START"]
-        if pd.isna(start) or pd.isna(pat["BIRTHDATE"]):
-            continue
-        age_years = (start - pat["BIRTHDATE"]).days / 365.25
-        sex_token = f"SEX_{str(pat['GENDER']).upper()}"
-        race_token = f"RACE_{clean_fragment(pat['RACE'])}"
-        age_token = bucket_age(age_years)
-        demo_by_enc[enc_id] = {"sex": sex_token, "race": race_token, "age": age_token}
-    return demo_by_enc
-
-
-def collect_event_tokens(cond_df, obs_df, meds_df, valid_encounters):
-    valid = set(valid_encounters)
-    events = defaultdict(list)
-
-    for _, row in cond_df.iterrows():
-        enc_id = str(row["ENCOUNTER"])
-        if enc_id not in valid:
-            continue
-        token = None
-        if not pd.isna(row["CODE"]):
-            code = clean_fragment(row["CODE"])
-            if code:
-                token = f"DX_{code}"
-        if not token:
-            continue
-        event_time = row["START"] if not pd.isna(row["START"]) else None
-        events[enc_id].append((event_time, token))
-
-    for _, row in obs_df.iterrows():
-        enc_id = str(row["ENCOUNTER"])
-        if enc_id not in valid:
-            continue
-        code_clean = clean_fragment(row["CODE"])
-        if code_clean not in OBS_WHITELIST:
-            continue
-        try:
-            value = float(row["VALUE"])
-        except (TypeError, ValueError):
-            continue
-        if pd.isna(value):
-            continue
-        obs_type, bucket = bin_observation(code_clean, value)
-        token = f"OBS_{obs_type}_{bucket}"
-        event_time = row["DATE"]
-        events[enc_id].append((event_time, token))
-
-    for _, row in meds_df.iterrows():
-        enc_id = str(row["ENCOUNTER"])
-        if enc_id not in valid:
-            continue
-        code = clean_fragment(row["CODE"])
-        if not code:
-            continue
-        token = f"MED_{code}"
-        event_time = row["START"] if not pd.isna(row["START"]) else None
-        events[enc_id].append((event_time, token))
-
-    return events
-
-
-def sort_events(events):
-    def sort_key(item):
-        ts, _ = item
-        if ts is None or pd.isna(ts):
-            return pd.Timestamp.max
-        return ts
-
-    return sorted(events, key=sort_key)
-
-
-def build_patient_event_index(events_by_encounter, encounter_meta):
-    patient_events = defaultdict(list)
+def build_patient_event_index(events_by_encounter: Dict[str, Iterable[Tuple[pd.Timestamp, str]]], encounters: pd.DataFrame) -> Dict[str, List[Tuple[pd.Timestamp, str]]]:
+    patient_events: Dict[str, List[Tuple[pd.Timestamp, str]]] = defaultdict(list)
+    patient_by_encounter = {}
+    for _, row in encounters.iterrows():
+        patient_by_encounter[str(row["ID"])] = str(row.get("PATIENT"))
     for enc_id, events in events_by_encounter.items():
-        meta = encounter_meta.get(enc_id)
-        if not meta:
+        patient = patient_by_encounter.get(str(enc_id))
+        if not patient:
             continue
-        patient = str(meta["patient"])
         for ts, token in events:
             if ts is None or pd.isna(ts):
                 continue
@@ -121,159 +43,143 @@ def build_patient_event_index(events_by_encounter, encounter_meta):
     return patient_events
 
 
-def generate_los_sequences(
-    encounters_df,
-    patients_df,
-    cond_df,
-    obs_df,
-    meds_df,
-    vocab,
-    allowed_classes,
-    one_hour,
-):
-    encounter_meta = {}
-    for _, row in encounters_df.iterrows():
-        encounter_meta[str(row["ID"])] = {
-            "patient": str(row["PATIENT"]),
-            "start": row["START"],
-            "stop": row["STOP"],
-        }
+def build_los_sequences(
+    events_by_encounter: Dict[str, Iterable[Tuple[pd.Timestamp, str]]],
+    encounters: pd.DataFrame,
+    vocab: Dict[str, int],
+    cutoff_hours: float = LOS_WINDOW_HOURS,
+    allowed_classes: Sequence[str] = ("INPATIENT",),
+) -> Tuple[List[dict], float]:
+    allowed = filter_encounters_by_class(encounters, allowed_classes)
+    patient_events = build_patient_event_index(events_by_encounter, encounters)
+    cutoff_delta = pd.Timedelta(hours=cutoff_hours)
+    specials = set(SPECIAL_TOKENS)
+    vocab_tokens = {tok for tok in vocab if tok not in specials}
 
-    demo_by_enc = build_demo_by_encounter(patients_df, encounters_df)
-    events_by_enc = collect_event_tokens(cond_df, obs_df, meds_df, encounter_meta.keys())
-    for enc_id, events in list(events_by_enc.items()):
-        events_by_enc[enc_id] = sort_events(events)
-
-    patient_events = build_patient_event_index(events_by_enc, encounter_meta)
-    target_encounters = filter_encounters_by_class(encounters_df, allowed_classes)
-    vocab_tokens = set(vocab.keys())
-
-    sequences = []
+    records: List[dict] = []
     lengths = []
-    for _, row in target_encounters.iterrows():
+    for _, row in allowed.iterrows():
         enc_id = str(row["ID"])
-        meta = encounter_meta.get(enc_id)
-        demo = demo_by_enc.get(enc_id)
-        if not meta or not demo:
-            continue
-        start = meta["start"]
-        stop = meta["stop"]
+        patient = str(row.get("PATIENT"))
+        start = row.get("START")
+        stop = row.get("STOP")
         if pd.isna(start) or pd.isna(stop):
             continue
         los_hours = (stop - start).total_seconds() / 3600.0
         if not np.isfinite(los_hours) or los_hours <= 0:
             continue
+        cutoff_time = start + cutoff_delta
 
-        cutoff = start + one_hour
-        patient_id = str(meta["patient"])
-        history_tokens = []
-        for ts, token in patient_events.get(patient_id, []):
-            if ts < start:
-                history_tokens.append(token)
-            else:
-                break
+        tokens = []
+        seen = set()
+        for ts, token in patient_events.get(patient, []):
+            if pd.isna(ts) or ts > cutoff_time:
+                continue
+            if token in vocab_tokens and token not in seen:
+                tokens.append(token)
+                seen.add(token)
 
-        curr_tokens = []
-        included_times = []
-        for ts, token in events_by_enc.get(enc_id, []):
-            if ts is None or pd.isna(ts):
-                continue
-            if ts < start:
-                continue
-            if ts > cutoff:
-                continue
-            curr_tokens.append(token)
-            included_times.append(ts)
-        if included_times:
-            assert all(ts <= cutoff for ts in included_times), "found event beyond cutoff in LOS sequence"
-
-        seq_tokens = [
-            "[ADMIT]",
-            demo["sex"],
-            demo["race"],
-            demo["age"],
-            *history_tokens,
-            *curr_tokens,
-            "[DISCH]",
-        ]
-        filtered_tokens = [tok for tok in seq_tokens if tok in vocab_tokens]
-        if len(filtered_tokens) < 2:
+        if not tokens:
             continue
 
-        sequences.append(
+        lengths.append(los_hours)
+        records.append(
             {
-                "patient_id": patient_id,
-                "encounter_id": enc_id,
-                "tokens": filtered_tokens,
+                "encounter": enc_id,
+                "patient": patient,
+                "start": start.isoformat(),
+                "stop": stop.isoformat(),
                 "los_hours": float(los_hours),
+                "tokens": tokens,
             }
         )
-        lengths.append(los_hours)
 
-    if not sequences:
-        raise ValueError("no LOS sequences generated; check filtering and input data.")
+    if not records:
+        raise ValueError("no LOS sequences generated; check encounter classes and cutoff.")
 
     median_hours = float(np.median(lengths))
-    for record in sequences:
-        record["los_label"] = int(record["los_hours"] > median_hours)
+    for record in records:
+        record["label"] = int(record["los_hours"] > median_hours)
 
-    return sequences
+    return records, median_hours
 
 
-def save_jsonl(records, path: Path):
+def save_jsonl(records: Iterable[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         for record in records:
             f.write(json.dumps(record) + "\n")
 
 
+def vectorize_instances(records: List[dict], vocab: Dict[str, int]) -> Tuple[sparse.csr_matrix, np.ndarray, List[str], List[str], List[str]]:
+    specials = set(SPECIAL_TOKENS)
+    classes = [tok for tok, idx in sorted(vocab.items(), key=lambda item: item[1]) if tok not in specials]
+    mlb = MultiLabelBinarizer(classes=classes, sparse_output=True)
+    token_lists = [rec["tokens"] for rec in records]
+    X = mlb.fit_transform(token_lists)
+    y = np.array([rec["label"] for rec in records], dtype=np.int64)
+    encounters = [rec["encounter"] for rec in records]
+    patients = [rec["patient"] for rec in records]
+    return sparse.csr_matrix(X), y, encounters, patients, classes
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build LOS sequences (history + first-hour events).")
-    parser.add_argument("--encounters_csv", type=Path, required=True, help="Path to encounters.csv")
-    parser.add_argument("--conditions_csv", type=Path, required=True, help="Path to conditions.csv")
-    parser.add_argument("--observations_csv", type=Path, required=True, help="Path to observations.csv")
-    parser.add_argument("--medications_csv", type=Path, required=True, help="Path to medications.csv")
-    parser.add_argument("--patients_csv", type=Path, required=True, help="Path to patients.csv")
-    parser.add_argument("--vocab_path", type=Path, required=True, help="Path to pretrained vocab JSON")
-    parser.add_argument("--output_path", type=Path, required=True, help="Output JSONL path for LOS sequences")
-    parser.add_argument(
-        "--allowed_classes",
-        type=str,
-        nargs="+",
-        default=list(ALLOWED_L0S_CLASSES),
-        help="Encounter classes eligible for LOS (default: INPATIENT)",
-    )
+    parser = argparse.ArgumentParser(description="Build LOS sequences using token events from build_sequences.")
+    parser.add_argument("--raw_dir", type=Path, default=Path("data") / "raw", help="Directory containing raw CSVs.")
+    parser.add_argument("--processed_dir", type=Path, default=Path("data") / "processed", help="Directory containing vocab.json and where LOS outputs are written.")
+    parser.add_argument("--allowed_classes", type=str, nargs="+", default=["INPATIENT"], help="Encounter classes to include.")
+    parser.add_argument("--cutoff_hours", type=float, default=LOS_WINDOW_HOURS, help="Include patient events up to this many hours after encounter start.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    encounters = load_encounters(args.encounters_csv)
-    conditions = load_conditions(args.conditions_csv)
-    observations = load_observations(args.observations_csv)
-    medications = load_medications(args.medications_csv)
-    patients = load_patients(args.patients_csv)
-    vocab = load_vocab(args.vocab_path) 
 
-    one_hour = pd.Timedelta(hours=1)
-    sequences = generate_los_sequences(
+    encounters = load_encounters(str(args.raw_dir))
+    conditions = load_conditions(str(args.raw_dir))
+    observations = load_observations(str(args.raw_dir))
+    windows = extract_encounter_windows(encounters)
+
+    try:
+        sequences, events_by_encounter = build_sequences(conditions, observations, windows, return_events=True)
+    except TypeError as e:
+        raise RuntimeError("build_sequences must support return_events=True to supply events for LOS.") from e
+    if not events_by_encounter:
+        raise ValueError("no events returned from build_sequences; cannot build LOS sequences.")
+
+    vocab_path = args.processed_dir / "vocab.json"
+    vocab = load_vocab(vocab_path)
+
+    records, median_hours = build_los_sequences(
+        events_by_encounter,
         encounters,
-        patients,
-        conditions,
-        observations,
-        medications,
         vocab,
+        cutoff_hours=args.cutoff_hours,
         allowed_classes=args.allowed_classes,
-        one_hour=one_hour,
     )
-    save_jsonl(sequences, args.output_path)
 
-    lengths = [len(rec["tokens"]) for rec in sequences]
-    avg_len = float(np.mean(lengths)) if lengths else 0.0
-    max_len = max(lengths) if lengths else 0
-    print(
-        f"Wrote {len(sequences)} LOS sequences to {args.output_path} | avg tokens: {avg_len:.1f} | max tokens: {max_len}"
+    inst_path = args.processed_dir / "los_instances.jsonl"
+    save_jsonl(records, inst_path)
+
+    X, y, encounter_ids, patient_ids, classes = vectorize_instances(records, vocab)
+    features_path = args.processed_dir / "los_features.npz"
+    labels_path = args.processed_dir / "los_labels.npz"
+    sparse.save_npz(features_path, X)
+    np.savez_compressed(
+        labels_path,
+        y=y,
+        encounter=np.array(encounter_ids),
+        patient=np.array(patient_ids),
+        median_hours=median_hours,
+        classes=np.array(classes),
     )
+
+    pos_rate = float(np.mean(y))
+    print(
+        f"LOS sequences: {len(records)} | median stay hours: {median_hours:.2f} | positive rate: {pos_rate:.3f}"
+    )
+    print(f"wrote instances to {inst_path}")
+    print(f"wrote features to {features_path} and labels/meta to {labels_path}")
 
 
 if __name__ == "__main__":
