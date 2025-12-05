@@ -1,16 +1,22 @@
+import argparse
+import csv
 import json
+import math
 import os
 import random
+from itertools import product
 from pathlib import Path
-from typing import Dict, Iterable
+from typing import Dict, Iterable, List, Optional
 
 import numpy as np
 import torch
 from tqdm.auto import tqdm
 
 from .config import (
+    ATTN_DROPOUT_PROB,
     BATCH_SIZE,
     GRAD_CLIP_NORM,
+    HIDDEN_DROPOUT_PROB,
     LEARNING_RATE,
     MAX_LEN,
     NUM_EPOCHS,
@@ -24,7 +30,14 @@ from .model import make_mlm_model
 from .vocab import load_vocab
 
 
-def train_epoch(model: torch.nn.Module, dataloader: Iterable[Dict[str, torch.Tensor]], optimizer: torch.optim.Optimizer, device: torch.device, print_every: int = PRINT_EVERY):
+def train_epoch(
+    model: torch.nn.Module,
+    dataloader: Iterable[Dict[str, torch.Tensor]],
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    print_every: int = PRINT_EVERY,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+):
     model.train()
     total_loss = 0.0
     total_correct = 0
@@ -43,6 +56,8 @@ def train_epoch(model: torch.nn.Module, dataloader: Iterable[Dict[str, torch.Ten
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         optimizer.zero_grad()
         total_loss += loss.item()
         if (step + 1) % print_every == 0:
@@ -77,7 +92,14 @@ def eval_epoch(model: torch.nn.Module, dataloader: Iterable[Dict[str, torch.Tens
     return avg_loss, accuracy
 
 
-def demo_mask_fill(model: torch.nn.Module, sequences: Iterable[dict], vocab: Dict[str, int], idx_to_token: Dict[int, str], device: torch.device, max_examples: int = 3):
+def demo_mask_fill(
+    model: torch.nn.Module,
+    sequences: Iterable[dict],
+    vocab: Dict[str, int],
+    idx_to_token: Dict[int, str],
+    device: torch.device,
+    max_examples: int = 3,
+):
     print("sample mask-fill predictions:")
     specials = set(SPECIAL_TOKENS)
     mask_token_id = vocab["[MASK]"]
@@ -120,10 +142,10 @@ def load_sequences(seq_path: Path):
         return [json.loads(line) for line in f]
 
 
-def main():
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
+def run_experiment(config: Dict, seed: int = SEED) -> Dict:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
     base_dir = Path(os.getcwd())
     processed_dir = base_dir / "data" / "processed"
@@ -138,27 +160,187 @@ def main():
 
     train_ids, val_ids = split_encounters(sequences)
     print(f"train encounters: {len(train_ids)} | val encounters: {len(val_ids)}")
-    train_loader, val_loader = make_dataloaders(str(seq_path), vocab, train_ids, val_ids, batch_size=BATCH_SIZE, max_len=MAX_LEN)
+    train_loader, val_loader = make_dataloaders(
+        str(seq_path), vocab, train_ids, val_ids, batch_size=BATCH_SIZE, max_len=MAX_LEN
+    )
 
-    model = make_mlm_model(len(vocab))
-    device = torch.device("cpu")
+    model = make_mlm_model(
+        len(vocab),
+        hidden_dropout_prob=config.get("dropout", HIDDEN_DROPOUT_PROB),
+        attn_dropout_prob=config.get("dropout", ATTN_DROPOUT_PROB),
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
     model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.get("learning_rate", LEARNING_RATE),
+        weight_decay=config.get("weight_decay", WEIGHT_DECAY),
+    )
+    total_steps = max(1, len(train_loader) * NUM_EPOCHS)
+    warmup_steps = max(1, int(0.1 * total_steps))
+
+    def lr_lambda(current_step: int):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = (current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     num_epochs = NUM_EPOCHS
+    best_val_loss = float("inf")
+    patience = 0
+    last_train_loss = float("nan")
+    last_train_acc = float("nan")
+    last_val_loss = float("nan")
+    last_val_acc = float("nan")
     for epoch in range(1, num_epochs + 1):
         print(f"epoch {epoch}/{num_epochs}")
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, device)
-        val_loss, val_acc = eval_epoch(model, val_loader, device)
-        if np.isnan(val_loss):
-            print(f"  train loss: {train_loss:.4f} | train acc: {train_acc:.4f} | val loss: n/a (no val set) | val acc: n/a")
+        last_train_loss, last_train_acc = train_epoch(
+            model, train_loader, optimizer, device, scheduler=scheduler
+        )
+        last_val_loss, last_val_acc = eval_epoch(model, val_loader, device)
+        if np.isnan(last_val_loss):
+            print(
+                f"  train loss: {last_train_loss:.4f} | train acc: {last_train_acc:.4f} | val loss: n/a (no val set) | val acc: n/a"
+            )
         else:
-            print(f"  train loss: {train_loss:.4f} | train acc: {train_acc:.4f} | val loss: {val_loss:.4f} | val acc: {val_acc:.4f}")
+            print(
+                f"  train loss: {last_train_loss:.4f} | train acc: {last_train_acc:.4f} | val loss: {last_val_loss:.4f} | val acc: {last_val_acc:.4f}"
+            )
+            if last_val_loss < best_val_loss:
+                best_val_loss = last_val_loss
+                patience = 0
+            else:
+                patience += 1
+                if patience >= 3:
+                    print("Early stopping: validation loss did not improve for 3 checks.")
+                    break
 
     model.save_pretrained(output_dir)
     print(f"saved model and artifacts to {output_dir}")
 
     demo_mask_fill(model, sequences, vocab, idx_to_token, device)
+    return {
+        "train_loss": last_train_loss,
+        "train_accuracy": last_train_acc,
+        "val_loss": last_val_loss,
+        "val_accuracy": last_val_acc,
+        "config": config,
+    }
+
+
+def run_hparam_search():
+    base_config = {
+        "learning_rate": LEARNING_RATE,
+        "weight_decay": WEIGHT_DECAY,
+        "dropout": HIDDEN_DROPOUT_PROB,
+    }
+    lrs = [
+        0.5 * base_config["learning_rate"],
+        base_config["learning_rate"],
+        2.0 * base_config["learning_rate"],
+    ]
+    dropouts = [0.1, 0.2]
+    weight_decays = [0.01, 0.05]
+
+    results: List[Dict] = []
+    for lr, dropout, weight_decay in product(lrs, dropouts, weight_decays):
+        cfg = dict(base_config)
+        cfg.update({"learning_rate": lr, "dropout": dropout, "weight_decay": weight_decay})
+        print(
+            f"\n=== Running config: lr={lr:.6f}, dropout={dropout}, weight_decay={weight_decay} ==="
+        )
+        res = run_experiment(cfg, seed=SEED)
+        res.update({"learning_rate": lr, "dropout": dropout, "weight_decay": weight_decay})
+        results.append(res)
+
+    if not results:
+        print("No results collected during hyperparameter search.")
+        return
+
+    base_dir = Path(os.getcwd())
+    output_dir = base_dir / "model"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "hparam_search_results.csv"
+    fieldnames = [
+        "learning_rate",
+        "dropout",
+        "weight_decay",
+        "train_loss",
+        "val_loss",
+        "val_accuracy",
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in results:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+    print(f"\nHyperparameter search results written to {csv_path}")
+
+    def _best_key(item):
+        return (round(item["val_loss"], 4), -item.get("val_accuracy", 0.0))
+
+    results_sorted = sorted(results, key=_best_key)
+    best = results_sorted[0]
+    print("\nResults (sorted by val_loss, tie-breaker val_accuracy):")
+    print(
+        f"{'lr':>10} {'dropout':>10} {'w_decay':>10} {'val_loss':>10} {'val_acc':>10} {'train_loss':>12}"
+    )
+    for r in results_sorted:
+        marker = "*" if r is best else " "
+        print(
+            f"{marker} {r['learning_rate']:>9.6f} {r['dropout']:>10.2f} {r['weight_decay']:>10.3f} {r['val_loss']:>10.4f} {r['val_accuracy']:>10.4f} {r['train_loss']:>12.4f}"
+        )
+    print(
+        f"\nBest config: lr={best['learning_rate']}, dropout={best['dropout']}, weight_decay={best['weight_decay']} (val_loss={best['val_loss']:.4f}, val_acc={best['val_accuracy']:.4f})"
+    )
+
+    best_config = {
+        "learning_rate": best["learning_rate"],
+        "dropout": best["dropout"],
+        "weight_decay": best["weight_decay"],
+    }
+    best_metrics = {
+        "train_loss": best.get("train_loss"),
+        "train_accuracy": best.get("train_accuracy"),
+        "val_loss": best.get("val_loss"),
+        "val_accuracy": best.get("val_accuracy"),
+        "batch_size": BATCH_SIZE,
+        "num_epochs": NUM_EPOCHS,
+        "seed": SEED,
+    }
+    config_path = output_dir / "best_hparam_config.json"
+    summary_path = output_dir / "best_hparam_summary.json"
+    with open(config_path, "w") as f:
+        json.dump(best_config, f, indent=2)
+    with open(summary_path, "w") as f:
+        json.dump({"config": best_config, "metrics": best_metrics}, f, indent=2)
+    print(f"Best configuration written to {config_path}")
+    print(f"Best run summary (config + metrics) written to {summary_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train masked LM or run hyperparameter search.")
+    parser.add_argument(
+        "--hparam_search",
+        action="store_true",
+        help="Run a small grid search over LR, dropout, and weight decay.",
+    )
+    args = parser.parse_args()
+
+    if args.hparam_search:
+        run_hparam_search()
+    else:
+        run_experiment(
+            {
+                "learning_rate": LEARNING_RATE,
+                "weight_decay": WEIGHT_DECAY,
+                "dropout": HIDDEN_DROPOUT_PROB,
+            },
+            seed=SEED,
+        )
 
 
 if __name__ == "__main__":

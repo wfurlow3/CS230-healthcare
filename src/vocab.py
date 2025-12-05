@@ -21,6 +21,8 @@ def build_vocab(sequences: Iterable[dict], max_size: int = VOCAB_LIMIT) -> Tuple
     for tok, count in token_counts.items():
         if tok.startswith("OBS_"):
             keep = True
+        elif tok.startswith(("SEX_", "RACE_", "AGE_")):
+            keep = True
         elif tok.startswith("DX_"):
             keep = count >= MIN_FREQ_DX
         elif tok.startswith("MED_"):

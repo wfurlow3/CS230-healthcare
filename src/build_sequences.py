@@ -15,18 +15,18 @@ from .utils import clean_fragment, bucket_age, OBS_WHITELIST, bin_observation
 def extract_encounter_windows(enc_df: pd.DataFrame) -> Dict[str, Tuple[pd.Timestamp, pd.Timestamp]]:
     windows = {}
     for _, row in enc_df.iterrows():
-        enc_id = row["Id"]
+        enc_id = row["ID"]
         start = row["START"]
         stop = row["STOP"]
         windows[str(enc_id)] = (start, stop)
     return windows
 
 def build_demo_by_encounter(patients_df, encounters_df):
-    patients = patients_df.set_index("Id")
+    patients = patients_df.set_index("ID")
     demo_by_enc = {}
 
     for _, row in encounters_df.iterrows():
-        enc_id = str(row["Id"])
+        enc_id = str(row["ID"])
         pat_id = row["PATIENT"]
         pat = patients.loc[pat_id]
 
