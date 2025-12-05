@@ -1,5 +1,7 @@
 import json
+import math
 import random
+from collections import Counter
 from typing import Dict, Iterable, Optional, Set, Tuple
 
 import torch
@@ -38,6 +40,7 @@ class EHRDataset(Dataset):
         seed: int = SEED,
     ):
         self.records = []
+        self.token_freq = Counter()
         allowed = set(allowed_encounters) if allowed_encounters else None
         with open(sequences_path, "r") as f:
             for line in f:
@@ -46,6 +49,7 @@ class EHRDataset(Dataset):
                     continue
                 ids = [vocab.get(tok, vocab["[MASK]"]) for tok in obj["tokens"]]
                 self.records.append(ids)
+                self.token_freq.update(ids)
         self.max_len = max_len
         self.mask_prob = mask_prob
         self.pad_id = vocab["[PAD]"]
@@ -70,7 +74,21 @@ class EHRDataset(Dataset):
         if candidates:
             num_to_mask = max(1, int(len(candidates) * self.mask_prob))
             num_to_mask = min(num_to_mask, len(candidates))
-            mask_positions = self.rng.sample(candidates, num_to_mask)
+            weights = [1.0 / math.sqrt(self.token_freq[ids[i]]) for i in candidates]
+            mask_positions = []
+            available_positions = list(candidates)
+            available_weights = list(weights)
+            for _ in range(num_to_mask):
+                total = sum(available_weights)
+                r = self.rng.random() * total
+                cum = 0.0
+                for idx, w in enumerate(available_weights):
+                    cum += w
+                    if cum >= r:
+                        chosen_pos = available_positions.pop(idx)
+                        available_weights.pop(idx)
+                        mask_positions.append(chosen_pos)
+                        break
             for pos in mask_positions:
                 labels[pos] = ids[pos]
                 rand = self.rng.random()
