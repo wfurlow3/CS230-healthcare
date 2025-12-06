@@ -142,15 +142,17 @@ def main():
     parser.add_argument("--labels_file", type=str, default="los_labels.npz")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--embed_dim", type=int, default=64, help="Embedding dimension when training from scratch (no pretrained).")
     parser.add_argument("--hidden_size", type=int, default=128)
     parser.add_argument("--num_layers", type=int, default=1)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--test_size", type=float, default=0.2)
-    parser.add_argument("--embeddings_path", type=Path, default=Path("word_embeddings.pt"), help="Pretrained embeddings tensor (vocab_size x dim) aligned to vocab.json.")
+    parser.add_argument("--embeddings_path", type=Path, default=None, help="Pretrained embeddings tensor (vocab_size x dim) aligned to vocab.json. If omitted, train embeddings from scratch.")
     parser.add_argument("--max_len", type=int, default=512, help="Maximum sequence length; keep last max_len tokens.")
     parser.add_argument("--freeze_emb", action="store_true", help="Freeze embedding weights during training.")
+    parser.add_argument("--metrics_path", type=Path, default=None, help="Optional path to save per-epoch metrics JSON.")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -166,24 +168,31 @@ def main():
     token_to_idx = {tok: i + 1 for i, tok in enumerate(classes)}  # reserve 0 for pad
 
     vocab = load_vocab(vocab_path)
-    embeddings_full = torch.load(args.embeddings_path, map_location="cpu")
-    if embeddings_full.ndim != 2:
-        raise ValueError("embeddings must be 2D (vocab_size x dim).")
-    vocab_size_full, embed_dim = embeddings_full.shape
-    if len(vocab) != vocab_size_full:
-        raise ValueError(f"vocab size {len(vocab)} does not match embeddings {vocab_size_full}.")
 
-    # Build embedding matrix aligned to classes ordering (pad at row 0).
-    emb_weight = torch.zeros(len(token_to_idx) + 1, embed_dim)
-    missing = []
-    for tok, row in token_to_idx.items():
-        vidx = vocab.get(tok)
-        if vidx is None:
-            missing.append(tok)
-            continue
-        emb_weight[row] = embeddings_full[vidx]
-    if missing:
-        raise ValueError(f"{len(missing)} tokens missing in embeddings/vocab: {missing[:5]}")
+    if args.embeddings_path is not None:
+        embeddings_full = torch.load(args.embeddings_path, map_location="cpu")
+        if embeddings_full.ndim != 2:
+            raise ValueError("embeddings must be 2D (vocab_size x dim).")
+        vocab_size_full, embed_dim = embeddings_full.shape
+        if len(vocab) != vocab_size_full:
+            raise ValueError(f"vocab size {len(vocab)} does not match embeddings {vocab_size_full}.")
+
+        emb_weight = torch.zeros(len(token_to_idx) + 1, embed_dim)
+        missing = []
+        for tok, row in token_to_idx.items():
+            vidx = vocab.get(tok)
+            if vidx is None:
+                missing.append(tok)
+                continue
+            emb_weight[row] = embeddings_full[vidx]
+        if missing:
+            raise ValueError(f"{len(missing)} tokens missing in embeddings/vocab: {missing[:5]}")
+        uses_pretrained = True
+    else:
+        embed_dim = args.embed_dim
+        emb_weight = torch.randn(len(token_to_idx) + 1, embed_dim) * 0.02
+        emb_weight[0].zero_()
+        uses_pretrained = False
 
     records = load_instances(instances_path)
     train_recs, val_recs = train_test_split(records, test_size=args.test_size, random_state=args.seed, stratify=[r["label"] for r in records])
@@ -200,9 +209,16 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+    metrics = {"train_loss": [], "val_loss": [], "val_acc": [], "val_f1": [], "val_auc": []}
+
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, device)
         val_loss, val_acc, val_f1, val_auc = eval_epoch(model, val_loader, device)
+        metrics["train_loss"].append(train_loss)
+        metrics["val_loss"].append(val_loss)
+        metrics["val_acc"].append(val_acc)
+        metrics["val_f1"].append(val_f1)
+        metrics["val_auc"].append(val_auc)
         print(
             f"epoch {epoch}/{args.epochs} | train loss {train_loss:.4f} | val loss {val_loss:.4f} | val acc {val_acc:.3f} | val f1 {val_f1:.3f} | val auc {val_auc:.3f}"
         )
@@ -210,6 +226,21 @@ def main():
     model_path = processed_dir / "los_gru.pt"
     torch.save({"model_state": model.state_dict(), "token_to_idx": token_to_idx, "config": vars(args), "embedding_dim": embed_dim}, model_path)
     print(f"saved GRU baseline to {model_path}")
+
+    metrics_path = args.metrics_path if args.metrics_path is not None else processed_dir / "los_gru_metrics.json"
+    config_serializable = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
+    with open(metrics_path, "w") as f:
+        json.dump(
+            {
+                "metrics": metrics,
+                "config": config_serializable,
+                "embedding_dim": embed_dim,
+                "uses_pretrained": uses_pretrained,
+            },
+            f,
+            indent=2,
+        )
+    print(f"saved metrics to {metrics_path}")
 
 
 if __name__ == "__main__":
