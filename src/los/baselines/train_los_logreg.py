@@ -1,17 +1,26 @@
 import argparse
 import json
 from pathlib import Path
-from typing import Tuple
+from typing import List, Tuple
 
 import numpy as np
-from scipy import sparse
+import torch
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 
 
-def load_data(features_path: Path, labels_path: Path) -> Tuple[sparse.csr_matrix, np.ndarray, dict]:
-    X = sparse.load_npz(features_path)
+def load_instances(instances_path: Path) -> List[dict]:
+    records = []
+    with open(instances_path, "r") as f:
+        for line in f:
+            records.append(json.loads(line))
+    if not records:
+        raise ValueError(f"no instances found at {instances_path}")
+    return records
+
+
+def load_labels(labels_path: Path) -> Tuple[np.ndarray, dict]:
     label_bundle = np.load(labels_path, allow_pickle=True)
     y = label_bundle["y"]
     meta = {
@@ -20,11 +29,45 @@ def load_data(features_path: Path, labels_path: Path) -> Tuple[sparse.csr_matrix
         "median_hours": float(label_bundle["median_hours"]),
         "classes": label_bundle["classes"].tolist(),
     }
-    return X, y, meta
+    return y, meta
+
+
+def load_vocab(vocab_path: Path) -> dict:
+    with open(vocab_path, "r") as f:
+        return json.load(f)
+
+
+def build_dense_features(records: List[dict], vocab: dict, embeddings: torch.Tensor) -> np.ndarray:
+    """
+    Build features that keep per-token counts (no truncation) AND include
+    a pooled embedding summary. For each encounter:
+      - counts: vocab_size vector with raw token counts (preserves identity)
+      - emb_sum: weighted sum of embeddings by count (dim)
+    Final feature = concat[counts, emb_sum] -> shape vocab_size + dim.
+    """
+    if embeddings.ndim != 2:
+        raise ValueError("embeddings tensor must be 2D (vocab_size x dim).")
+    vocab_size, dim = embeddings.shape
+    if len(vocab) != vocab_size:
+        raise ValueError(f"vocab size {len(vocab)} does not match embeddings {vocab_size}.")
+
+    vectors = []
+    for rec in records:
+        counts = torch.zeros(vocab_size, dtype=torch.float32)
+        for tok in rec["tokens"]:
+            idx = vocab.get(tok)
+            if idx is not None:
+                counts[idx] += 1.0
+        if counts.sum() == 0:
+            raise ValueError(f"encounter {rec.get('encounter')} has no tokens in vocab.")
+        emb_sum = counts @ embeddings  # (dim,)
+        feat = torch.cat([counts, emb_sum], dim=0)
+        vectors.append(feat)
+    return torch.stack(vectors).numpy()
 
 
 def train_baseline(
-    X: sparse.csr_matrix,
+    X: np.ndarray,
     y: np.ndarray,
     seed: int = 13,
     test_size: float = 0.2,
@@ -35,8 +78,8 @@ def train_baseline(
 
     model = LogisticRegression(
         penalty="l2",
-        solver="saga",
-        max_iter=10000,
+        solver="lbfgs",
+        max_iter=5000,
         n_jobs=-1,
         class_weight="balanced",
     )
@@ -68,26 +111,41 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=13, help="Random seed for split and model.")
     parser.add_argument("--test_size", type=float, default=0.2, help="Validation split fraction.")
+    parser.add_argument(
+        "--embeddings_path",
+        type=Path,
+        default=Path("word_embeddings.pt"),
+        help="Path to pretrained embeddings tensor (vocab_size x dim).",
+    )
     args = parser.parse_args()
 
-    features_path = args.processed_dir / "los_features.npz"
     labels_path = args.processed_dir / "los_labels.npz"
+    instances_path = args.processed_dir / "los_instances.jsonl"
+    vocab_path = args.processed_dir / "vocab.json"
 
-    X, y, meta = load_data(features_path, labels_path)
-    print(f"loaded features {X.shape} | positives={int(y.sum())}/{len(y)}")
+    records = load_instances(instances_path)
+    y, meta = load_labels(labels_path)
+    vocab = load_vocab(vocab_path)
+    embeddings = torch.load(args.embeddings_path, map_location="cpu")
+    X = build_dense_features(records, vocab, embeddings)
+
+    if X.shape[0] != len(y):
+        raise ValueError(f"feature rows ({X.shape[0]}) and labels ({len(y)}) mismatch.")
+
+    print(f"loaded dense features {X.shape} | positives={int(y.sum())}/{len(y)}")
     print(f"median stay hours used for label: {meta['median_hours']:.2f}")
 
     model = train_baseline(X, y, seed=args.seed, test_size=args.test_size)
 
-    model_path = args.processed_dir / "los_logreg.npz"
-    sparse.save_npz(model_path, sparse.csr_matrix(model.coef_))
+    model_path = args.processed_dir / "los_logreg_dense.npz"
+    np.savez_compressed(model_path, coef_=model.coef_, intercept_=model.intercept_)
     with open(args.processed_dir / "los_logreg_meta.json", "w") as f:
         json.dump(
             {
-                "intercept": model.intercept_.tolist(),
                 "classes": meta["classes"],
                 "seed": args.seed,
                 "test_size": args.test_size,
+                "embeddings_path": str(args.embeddings_path),
             },
             f,
             indent=2,
