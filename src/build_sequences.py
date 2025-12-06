@@ -45,7 +45,7 @@ def build_demo_by_encounter(patients_df, encounters_df):
 
     return demo_by_enc
 
-def build_sequences(cond_df: pd.DataFrame, obs_df: pd.DataFrame, windows: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]], meds_df: pd.DataFrame, demo_by_enc) -> List[Dict[str, Iterable[str]]]:
+def build_sequences(cond_df: pd.DataFrame, obs_df: pd.DataFrame, windows: Dict[str, Tuple[pd.Timestamp, pd.Timestamp]], meds_df: pd.DataFrame, demo_by_enc, return_events=False):
     events: Dict[str, List[Tuple[pd.Timestamp, str]]] = defaultdict(list)
     
     # Conditions
@@ -130,7 +130,7 @@ def build_sequences(cond_df: pd.DataFrame, obs_df: pd.DataFrame, windows: Dict[s
         seq_tokens.append("[DISCH]")
         
         sequences.append({"encounter": enc_id, "tokens": seq_tokens})
-    return sequences
+    return (sequences, events) if return_events else sequences
 
 
 def save_sequences(sequences: Iterable[dict], path: Path) -> None:
