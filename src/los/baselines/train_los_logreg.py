@@ -152,7 +152,21 @@ def main():
         )
     print(f"saved logistic regression weights to {model_path} and metadata to los_logreg_meta.json")
 
+    # Save predictions for downstream error analysis (full dataset, probability of class 1).
+    try:
+        y_score = model.predict_proba(X)[:, 1]
+        preds_path = args.processed_dir / "los_logreg_preds.npz"
+        np.savez_compressed(
+            preds_path,
+            y_true=y,
+            y_score=y_score,
+            encounter=meta.get("encounter"),
+            patient=meta.get("patient"),
+        )
+        print(f"saved prediction bundle for error analysis to {preds_path}")
+    except Exception as e:
+        print(f"warning: could not save prediction bundle: {e}")
+
 
 if __name__ == "__main__":
     main()
-

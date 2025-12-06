@@ -153,6 +153,26 @@ def eval_epoch(model, dataloader, device):
     return total_loss / max(1, len(dataloader)), acc, f1, auc
 
 
+def predict_probs(model, dataloader, device):
+    model.eval()
+    scores = []
+    labels = []
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            logits = model(batch["input_ids"], batch["attention_mask"])
+            probs = torch.sigmoid(logits).cpu()
+            scores.append(probs)
+            labels.append(batch["label"].cpu())
+    if scores:
+        scores = torch.cat(scores).numpy()
+        labels = torch.cat(labels).numpy()
+    else:
+        scores = np.array([])
+        labels = np.array([])
+    return labels, scores
+
+
 def main():
     parser = argparse.ArgumentParser(description="Transformer baseline for LOS classification on token sequences.")
     parser.add_argument("--processed_dir", type=Path, default=Path("data") / "processed")
@@ -235,6 +255,23 @@ def main():
             f"epoch {epoch}/{args.epochs} | train loss {train_loss:.4f} | val loss {val_loss:.4f} | val acc {val_acc:.3f} | val f1 {val_f1:.3f} | val auc {val_auc:.3f}"
         )
 
+    # Save predictions on validation split for error analysis.
+    val_y, val_scores = predict_probs(model, val_loader, device)
+    try:
+        encounters_val = [rec.get("encounter") for rec in val_recs]
+        patients_val = [rec.get("patient") for rec in val_recs]
+        preds_path = processed_dir / "los_transformer_val_preds.npz"
+        np.savez_compressed(
+            preds_path,
+            y_true=val_y,
+            y_score=val_scores,
+            encounter=np.array(encounters_val),
+            patient=np.array(patients_val),
+        )
+        print(f"saved validation prediction bundle for error analysis to {preds_path}")
+    except Exception as e:
+        print(f"warning: could not save validation prediction bundle: {e}")
+
     model_path = processed_dir / "los_transformer.pt"
     torch.save({"model_state": model.state_dict(), "token_to_idx": token_to_idx, "config": vars(args), "embedding_dim": emb_weight.shape[1]}, model_path)
     print(f"saved transformer baseline to {model_path}")
@@ -242,4 +279,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
