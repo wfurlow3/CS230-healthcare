@@ -44,3 +44,7 @@ Notes
 -----
 - Always run `main.py` before `src/los/preprocess_los.py` so LOS tokens align with the vocab used by pretrained embeddings.
 - LOS scripts default to balanced class weights and fixed seeds; adjust CLI flags as needed. 
+
+Data: 1K Sample Synthetic Patient Records, CSV from https://synthea.mitre.org/downloads
+
+
