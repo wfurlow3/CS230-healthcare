@@ -22,9 +22,10 @@ def load_instances(instances_path: Path) -> List[dict]:
 
 
 class LOSSequenceDataset(Dataset):
-    def __init__(self, records: List[dict], token_to_idx: dict):
+    def __init__(self, records: List[dict], token_to_idx: dict, max_len: int):
         self.token_to_idx = token_to_idx
         self.records = records
+        self.max_len = max_len
 
     def __len__(self):
         return len(self.records)
@@ -32,6 +33,8 @@ class LOSSequenceDataset(Dataset):
     def __getitem__(self, idx):
         record = self.records[idx]
         tokens = record["tokens"]
+        if self.max_len and len(tokens) > self.max_len:
+            tokens = tokens[-self.max_len:]  # keep last max_len tokens
         ids = [self.token_to_idx.get(tok, -1) for tok in tokens]
         ids = [i for i in ids if i >= 0]
         return {
@@ -157,6 +160,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--test_size", type=float, default=0.2)
+    parser.add_argument("--max_len", type=int, default=512, help="Maximum sequence length; keeps the last max_len tokens.")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -170,10 +174,12 @@ def main():
     token_to_idx = {tok: i + 1 for i, tok in enumerate(classes)}  # reserve 0 for pad
 
     records = load_instances(instances_path)
+    # Respect max_len by truncating sequences to the last max_len tokens.
+    max_len = args.max_len
     train_recs, val_recs = train_test_split(records, test_size=args.test_size, random_state=args.seed, stratify=[r["label"] for r in records])
 
-    train_ds = LOSSequenceDataset(train_recs, token_to_idx)
-    val_ds = LOSSequenceDataset(val_recs, token_to_idx)
+    train_ds = LOSSequenceDataset(train_recs, token_to_idx, max_len=max_len)
+    val_ds = LOSSequenceDataset(val_recs, token_to_idx, max_len=max_len)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
@@ -186,7 +192,7 @@ def main():
         num_layers=args.num_layers,
         dim_ff=args.dim_ff,
         dropout=args.dropout,
-        max_len=512,
+        max_len=max_len,
     )
     model.to(device)
 
