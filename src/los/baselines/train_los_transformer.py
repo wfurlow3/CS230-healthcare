@@ -21,6 +21,11 @@ def load_instances(instances_path: Path) -> List[dict]:
     return records
 
 
+def load_vocab(vocab_path: Path) -> dict:
+    with open(vocab_path, "r") as f:
+        return json.load(f)
+
+
 class LOSSequenceDataset(Dataset):
     def __init__(self, records: List[dict], token_to_idx: dict, max_len: int):
         self.token_to_idx = token_to_idx
@@ -76,9 +81,12 @@ class PositionalEmbedding(nn.Module):
 
 
 class TransformerBaseline(nn.Module):
-    def __init__(self, vocab_size: int, embed_dim: int = 64, num_heads: int = 4, num_layers: int = 2, dim_ff: int = 128, dropout: float = 0.1, max_len: int = 512):
+    def __init__(self, embedding_weight: torch.Tensor, num_heads: int = 4, num_layers: int = 2, dim_ff: int = 128, dropout: float = 0.1, max_len: int = 512, freeze_emb: bool = False):
         super().__init__()
+        vocab_size, embed_dim = embedding_weight.shape
         self.token_emb = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.token_emb.weight.data.copy_(embedding_weight)
+        self.token_emb.weight.requires_grad = not freeze_emb
         self.pos_emb = PositionalEmbedding(max_len=max_len, embed_dim=embed_dim)
         encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=dim_ff, dropout=dropout, batch_first=True)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
@@ -152,7 +160,6 @@ def main():
     parser.add_argument("--labels_file", type=str, default="los_labels.npz")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--embed_dim", type=int, default=64)
     parser.add_argument("--num_heads", type=int, default=4)
     parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--dim_ff", type=int, default=128)
@@ -160,7 +167,9 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--test_size", type=float, default=0.2)
-    parser.add_argument("--max_len", type=int, default=512, help="Maximum sequence length; keeps the last max_len tokens.")
+    parser.add_argument("--max_len", type=int, default=512, help="Maximum sequence length; keeps the last max_len tokens and sizes positional embeddings.")
+    parser.add_argument("--embeddings_path", type=Path, default=Path("word_embeddings.pt"), help="Pretrained embeddings tensor (vocab_size x dim) aligned to vocab.json.")
+    parser.add_argument("--freeze_emb", action="store_true", help="Freeze embedding weights during training.")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -169,12 +178,33 @@ def main():
     processed_dir = args.processed_dir
     instances_path = processed_dir / args.instances_file
     labels_path = processed_dir / args.labels_file
+    vocab_path = processed_dir / "vocab.json"
+
     label_bundle = np.load(labels_path, allow_pickle=True)
     classes = label_bundle["classes"].tolist()
     token_to_idx = {tok: i + 1 for i, tok in enumerate(classes)}  # reserve 0 for pad
 
+    vocab = load_vocab(vocab_path)
+    embeddings_full = torch.load(args.embeddings_path, map_location="cpu")
+    if embeddings_full.ndim != 2:
+        raise ValueError("embeddings must be 2D (vocab_size x dim).")
+    vocab_size_full, embed_dim = embeddings_full.shape
+    if len(vocab) != vocab_size_full:
+        raise ValueError(f"vocab size {len(vocab)} does not match embeddings {vocab_size_full}.")
+
+    # Build embedding matrix aligned to classes ordering (pad row 0).
+    emb_weight = torch.zeros(len(token_to_idx) + 1, embed_dim)
+    missing = []
+    for tok, row in token_to_idx.items():
+        vidx = vocab.get(tok)
+        if vidx is None:
+            missing.append(tok)
+            continue
+        emb_weight[row] = embeddings_full[vidx]
+    if missing:
+        raise ValueError(f"{len(missing)} tokens missing in embeddings/vocab: {missing[:5]}")
+
     records = load_instances(instances_path)
-    # Respect max_len by truncating sequences to the last max_len tokens.
     max_len = args.max_len
     train_recs, val_recs = train_test_split(records, test_size=args.test_size, random_state=args.seed, stratify=[r["label"] for r in records])
 
@@ -186,13 +216,13 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = TransformerBaseline(
-        vocab_size=len(token_to_idx) + 1,
-        embed_dim=args.embed_dim,
+        embedding_weight=emb_weight,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
         dim_ff=args.dim_ff,
         dropout=args.dropout,
         max_len=max_len,
+        freeze_emb=args.freeze_emb,
     )
     model.to(device)
 
@@ -206,7 +236,7 @@ def main():
         )
 
     model_path = processed_dir / "los_transformer.pt"
-    torch.save({"model_state": model.state_dict(), "token_to_idx": token_to_idx, "config": vars(args)}, model_path)
+    torch.save({"model_state": model.state_dict(), "token_to_idx": token_to_idx, "config": vars(args), "embedding_dim": emb_weight.shape[1]}, model_path)
     print(f"saved transformer baseline to {model_path}")
 
 
