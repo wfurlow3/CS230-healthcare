@@ -130,7 +130,7 @@ def main():
     parser.add_argument("--instances_file", type=str, default="los_instances.jsonl")
     parser.add_argument("--labels_file", type=str, default="los_labels.npz")
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--embed_dim", type=int, default=64)
     parser.add_argument("--hidden_size", type=int, default=128)
     parser.add_argument("--num_layers", type=int, default=1)
