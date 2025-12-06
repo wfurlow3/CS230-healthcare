@@ -5,6 +5,10 @@ Overview
 --------
 This project builds tokenized EHR sequences, trains a masked language model (MLM), and provides downstream length-of-stay (LOS) baselines.
 
+Data
+----------------
+1K Sample Synthetic Patient Records, CSV from https://synthea.mitre.org/downloads
+
 High-level steps
 ----------------
 1) Run `main.py` to build sequences/vocab and train the MLM.
@@ -44,7 +48,5 @@ Notes
 -----
 - Always run `main.py` before `src/los/preprocess_los.py` so LOS tokens align with the vocab used by pretrained embeddings.
 - LOS scripts default to balanced class weights and fixed seeds; adjust CLI flags as needed. 
-
-Data: 1K Sample Synthetic Patient Records, CSV from https://synthea.mitre.org/downloads
 
 
